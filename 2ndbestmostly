@@ -1,0 +1,300 @@
+# ======================================================
+# 💪 Weighted Stress–Recovery–Resilience Indices (Correlation-based)
+# Subject-centered data + RF & XGBoost + export
+# ======================================================
+
+!pip install -q scikit-learn pandas numpy matplotlib seaborn xgboost
+
+import os, json, zipfile, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.experimental import enable_iterative_imputer  # noqa
+from sklearn.impute import IterativeImputer
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from scipy.stats import pearsonr
+
+warnings.filterwarnings("ignore")
+
+# ====== CONFIG ======
+csv_path = "/content/All_subjects_segments60.csv"   # <-- change if needed
+outdir = "/content/weighted_indices_outputs"
+os.makedirs(outdir, exist_ok=True)
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# ======================================================
+# 1) Load & robust preprocessing
+# ======================================================
+df = pd.read_csv(csv_path)
+print("✅ Loaded:", df.shape)
+
+for c in ["scope", "segment", "Subject_Name", "ApEn",'SubjectID']:
+    if c in df.columns:
+        df.drop(columns=c, inplace=True)
+
+def norm_cond(x):
+    lx = str(x).strip().lower()
+    if lx in {"baseline","base"}: return "Baseline"
+    if lx in {"stroop","mat","stress"}: return "Stress"
+    if lx in {"recovery","post","post_stress"}: return "Recovery"
+    return x
+df["condition"] = df["condition"].apply(norm_cond)
+
+num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+num_cols = [c for c in num_cols if c not in ["Subject_ID"]]
+
+# Winsorize 1%/99%
+q_low, q_hi = df[num_cols].quantile(0.01), df[num_cols].quantile(0.99)
+for c in num_cols:
+    df[c] = np.clip(df[c], q_low[c], q_hi[c])
+
+# Log-transform skewed positives
+sk = df[num_cols].skew(numeric_only=True)
+for c in num_cols:
+    if (df[c] > 0).all() and abs(sk[c]) > 1.0:
+        df[c] = np.log1p(df[c])
+
+# Impute + scale
+imp = IterativeImputer(random_state=RANDOM_SEED, max_iter=15)
+scaler = RobustScaler()
+df[num_cols] = imp.fit_transform(df[num_cols])
+df[num_cols] = scaler.fit_transform(df[num_cols])
+
+# ======================================================
+# 2) Baseline centering
+# ======================================================
+baseline_means = (
+    df[df["condition"]=="Baseline"]
+      .groupby("Subject_ID")[num_cols]
+      .mean()
+      .add_prefix("BL_")
+      .reset_index()
+)
+df = df.merge(baseline_means, on="Subject_ID", how="left")
+for c in num_cols:
+    blc = f"BL_{c}"
+    if blc in df.columns:
+        df[c] = df[c] - df[blc]
+df.drop(columns=[c for c in df.columns if c.startswith("BL_")], inplace=True)
+
+# ======================================================
+# 3) Aggregate per Subject × Condition
+# ======================================================
+agg = df.groupby(["Subject_ID","condition"], as_index=False)[num_cols].mean()
+wide = agg.pivot_table(index="Subject_ID", columns="condition", values=num_cols)
+wide.columns = [f"{feat}{cond}" for feat,cond in wide.columns.to_flat_index()]
+wide = wide.reset_index()
+
+# ✅ FIXED SECTION — replaced buggy split("") logic
+def have_all(f):
+    return all(f"{f}{p}" in wide.columns for p in ["Baseline","Stress","Recovery"])
+
+base_feats = sorted({
+    c.replace("Baseline","").replace("Stress","").replace("Recovery","")
+    for c in wide.columns
+    if any(p in c for p in ["Baseline","Stress","Recovery"])
+    and c != "Subject_ID"
+})
+base_feats = [f for f in base_feats if have_all(f)]
+print("Features with all phases:", len(base_feats))
+
+# ======================================================
+# 4) Compute per-feature SI_f, RI_f
+# ======================================================
+eps = 1e-9
+for f in base_feats:
+    B, S, R = wide[f"{f}Baseline"], wide[f"{f}Stress"], wide[f"{f}Recovery"]
+    wide[f"SI_{f}"] = np.abs(np.log1p(np.abs(S)) - np.log1p(np.abs(B)))
+    wide[f"RI_{f}"] = ((R - S) / (B - S + eps)).clip(0,1)
+
+SI_mat = wide[[f"SI_{f}" for f in base_feats]]
+RI_mat = wide[[f"RI_{f}" for f in base_feats]]
+
+# ======================================================
+# 5) Derive correlation-based feature weights
+# ======================================================
+si_mean = SI_mat.mean(axis=1)
+ri_mean = RI_mat.mean(axis=1)
+
+def feature_corr_weight(col, ref):
+    r = np.corrcoef(col, ref)[0,1] if np.std(col)>0 else 0
+    return np.abs(r) if not np.isnan(r) else 0
+
+si_weights = SI_mat.apply(lambda x: feature_corr_weight(x, si_mean), axis=0)
+ri_weights = RI_mat.apply(lambda x: feature_corr_weight(x, ri_mean), axis=0)
+
+# Normalize
+si_weights /= si_weights.sum()
+ri_weights /= ri_weights.sum()
+
+print("\nTop 10 weighted SI features:")
+print(si_weights.sort_values(ascending=False).head(10))
+print("\nTop 10 weighted RI features:")
+print(ri_weights.sort_values(ascending=False).head(10))
+
+# ======================================================
+# 6) Weighted subject-level indices
+# ======================================================
+wide["SI_weighted"] = (SI_mat * si_weights).sum(axis=1)
+wide["RI_weighted"] = (RI_mat * ri_weights).sum(axis=1)
+wide["RZ_weighted"] = wide["RI_weighted"] / (wide["SI_weighted"] + eps)
+
+# store also unweighted for comparison
+wide["SI_true"] = SI_mat.mean(axis=1)
+wide["RI_true"] = RI_mat.mean(axis=1)
+wide["RZ_true"] = wide["RI_true"] / (wide["SI_true"] + eps)
+
+# ======================================================
+# 7) Build modeling features (levels + deltas/ratios)
+# ======================================================
+X_parts = {}
+for f in base_feats:
+    B, S, R = wide[f"{f}Baseline"], wide[f"{f}Stress"], wide[f"{f}Recovery"]
+    X_parts[f"{f}__Baseline"] = B
+    X_parts[f"{f}__Stress"]   = S
+    X_parts[f"{f}__Recovery"] = R
+    X_parts[f"{f}__SminusB"]  = S - B
+    X_parts[f"{f}__RminusS"]  = R - S
+    X_parts[f"{f}__RminusB"]  = R - B
+    denomB, denomS = B.replace(0,np.nan), S.replace(0,np.nan)
+    X_parts[f"{f}__S_over_B"] = (S/denomB).replace([np.inf,-np.inf], np.nan)
+    X_parts[f"{f}__R_over_S"] = (R/denomS).replace([np.inf,-np.inf], np.nan)
+
+X = pd.DataFrame(X_parts).fillna(0.0)
+subjects = wide["Subject_ID"].values
+
+targets = {
+    "SI": wide["SI_weighted"].values,
+    "RI": wide["RI_weighted"].values,
+    "RZ": wide["RZ_weighted"].values,
+}
+
+# ======================================================
+# 8) Train/test split by subject
+# ======================================================
+Xtr, Xte, subtr, subte = train_test_split(X, subjects, test_size=0.3, random_state=RANDOM_SEED)
+mask_tr = np.isin(subjects, subtr)
+mask_te = np.isin(subjects, subte)
+
+X_train, X_test = X.iloc[mask_tr], X.iloc[mask_te]
+y_train = {k: v[mask_tr] for k,v in targets.items()}
+y_test  = {k: v[mask_te] for k,v in targets.items()}
+
+# ======================================================
+# 9) Helper funcs
+# ======================================================
+def fit_with_selection(model_name, Xtr, ytr, top_k=25, seed=42):
+    if model_name == "RF":
+        base = RandomForestRegressor(n_estimators=500, random_state=seed, n_jobs=-1)
+    elif model_name == "XGB":
+        base = XGBRegressor(
+            n_estimators=600, learning_rate=0.05, max_depth=4,
+            subsample=0.9, colsample_bytree=0.9, random_state=seed, n_jobs=-1,
+            reg_lambda=1.0, objective="reg:squarederror"
+        )
+    else:
+        raise ValueError("Unknown model_name")
+
+    base.fit(Xtr, ytr)
+    importances = pd.Series(base.feature_importances_, index=Xtr.columns).sort_values(ascending=False)
+    keep = importances.head(min(top_k, (importances > 0).sum() or top_k)).index.tolist()
+
+    final = type(base)(**base.get_params())
+    final.fit(Xtr[keep], ytr)
+    return final, keep, importances
+
+def metrics(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    pr, pp = pearsonr(y_true, y_pred) if len(y_true)>1 else (np.nan,np.nan)
+    return dict(R2=r2, MAE=mae, RMSE=rmse, Pearson_r=pr, p_value=pp)
+
+def scatter_true_pred(y_true, y_pred, title, path):
+    plt.figure(figsize=(5,5))
+    sns.scatterplot(x=y_true, y=y_pred, s=40)
+    lim = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    plt.plot(lim, lim, '--k', linewidth=1)
+    plt.xlabel("True"); plt.ylabel("Predicted")
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(path, dpi=160); plt.show()
+
+def plot_importances(importances, title, path, top=15):
+    top_series = importances.head(top)[::-1]
+    plt.figure(figsize=(6.2,4.8))
+    plt.barh(top_series.index, top_series.values)
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(path, dpi=160); plt.show()
+
+# ======================================================
+# 🔟 Train & evaluate (RF + XGB)
+# ======================================================
+results, selected = {}, {}
+
+for target_name in ["SI","RI","RZ"]:
+    ytr, yte = y_train[target_name], y_test[target_name]
+
+    rf_model, rf_keep, rf_imp = fit_with_selection("RF", X_train, ytr, top_k=25, seed=11)
+    rf_pred = rf_model.predict(X_test[rf_keep])
+    rf_metrics = metrics(yte, rf_pred)
+    results[f"{target_name}_RF"] = rf_metrics
+    selected[f"{target_name}_RF_features"] = list(rf_keep)
+
+    scatter_true_pred(yte, rf_pred,
+        f"{target_name} — RF\nR²={rf_metrics['R2']:.3f}, r={rf_metrics['Pearson_r']:.3f}",
+        f"{outdir}/{target_name.lower()}_rf_true_vs_pred.png")
+    plot_importances(rf_imp, f"{target_name} — RF Top Features",
+        f"{outdir}/{target_name.lower()}_rf_feature_importance.png")
+
+    xgb_model, xgb_keep, xgb_imp = fit_with_selection("XGB", X_train, ytr, top_k=25, seed=22)
+    xgb_pred = xgb_model.predict(X_test[xgb_keep])
+    xgb_metrics = metrics(yte, xgb_pred)
+    results[f"{target_name}_XGB"] = xgb_metrics
+    selected[f"{target_name}_XGB_features"] = list(xgb_keep)
+
+    scatter_true_pred(yte, xgb_pred,
+        f"{target_name} — XGB\nR²={xgb_metrics['R2']:.3f}, r={xgb_metrics['Pearson_r']:.3f}",
+        f"{outdir}/{target_name.lower()}_xgb_true_vs_pred.png")
+    plot_importances(xgb_imp, f"{target_name} — XGB Top Features",
+        f"{outdir}/{target_name.lower()}_xgb_feature_importance.png")
+
+# ======================================================
+# 11) Save predictions & summary
+# ======================================================
+best_preds = pd.DataFrame({"Subject_ID": subte})
+for target_name in ["SI","RI","RZ"]:
+    xgb_model, xgb_keep, _ = fit_with_selection("XGB", X_train, y_train[target_name], top_k=25, seed=22)
+    best_preds[f"{target_name}_true"] = y_test[target_name]
+    best_preds[f"{target_name}_pred_XGB"] = xgb_model.predict(X_test[xgb_keep])
+
+best_preds.to_csv(f"{outdir}/per_subject_results_test.csv", index=False)
+
+summary = {
+    "n_subjects_total": int(wide["Subject_ID"].nunique()),
+    "models": results,
+    "selected_features": selected,
+    "weight_summary": {
+        "top_SI_features": si_weights.sort_values(ascending=False).head(10).to_dict(),
+        "top_RI_features": ri_weights.sort_values(ascending=False).head(10).to_dict(),
+    }
+}
+with open(f"{outdir}/summary.json","w") as f:
+    json.dump(summary, f, indent=2)
+with open(f"{outdir}/upload_me_for_analysis.json","w") as f:
+    json.dump(summary, f, indent=2)
+
+zip_path = "/content/weighted_indices_outputs.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk(outdir):
+        for fn in files:
+            p = os.path.join(root, fn)
+            z.write(p, os.path.relpath(p, outdir))
+
+print("\n✅ Weighted Stress/Recovery/Resilience indices computed and models trained.")
+print("ZIP saved at:", zip_path)
