@@ -1,0 +1,221 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score
+)
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from deap import base, creator, tools, algorithms
+import random
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------
+# Load dataset
+# ---------------------------------------------------------
+df = pd.read_csv('/content/All_subjects_segments30.csv')
+
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+df['label'] = df['condition'].map({'Baseline': 0, 'Recovery': 0,
+                                   'Stroop': 1, 'MAT': 1})
+df = df.drop(columns=['condition'], errors='ignore')
+
+X = df.drop(columns=['label'])
+y = df['label'].astype(int)
+
+# ---------------------------------------------------------
+# 80/20 Test Split FIRST (NO LEAKAGE)
+# ---------------------------------------------------------
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+# ---------------------------------------------------------
+# Impute missing values (fit on train, transform on test)
+# ---------------------------------------------------------
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp  = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+# ---------------------------------------------------------
+# Log-transform skewed features (train → detect, both → transform)
+# ---------------------------------------------------------
+skew_threshold = 1.0
+skew_vals = X_train_imp.skew()
+skewed_features = skew_vals[abs(skew_vals) > skew_threshold].index.tolist()
+
+X_train_imp[skewed_features] = np.log1p(X_train_imp[skewed_features])
+X_test_imp[skewed_features]  = np.log1p(X_test_imp[skewed_features])
+
+# ---------------------------------------------------------
+# Scaling (fit on train, transform on test)
+# ---------------------------------------------------------
+scaler = RobustScaler()
+X_train = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test  = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+# ---------------------------------------------------------
+# Multi-Objective GA (NSGA-II)
+# Objectives:
+#   1) Maximize CV Accuracy
+#   2) Minimize number of features
+# ---------------------------------------------------------
+X_full = X_train.copy()
+n_features = X_full.shape[1]
+
+# Reset DEAP classes
+if "FitnessMulti" in creator.__dict__:
+    del creator.FitnessMulti
+if "Individual" in creator.__dict__:
+    del creator.Individual
+
+# weights=(1.0, -1.0): maximize accuracy, minimize #features
+creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0))
+creator.create("Individual", list, fitness=creator.FitnessMulti)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual,
+                 toolbox.attr_bool, n_features)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+# Fitness function
+def eval_individual(individual):
+    selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
+
+    if len(selected_cols) == 0:
+        return (0.0, n_features)  # worst fitness
+
+    X_sub = X_full[selected_cols].values
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    scores = []
+    for tr, va in cv.split(X_sub, y_train):
+        rf = RandomForestClassifier(n_estimators=150, random_state=42)
+        rf.fit(X_sub[tr], y_train.iloc[tr])
+        pred = rf.predict(X_sub[va])
+        scores.append(accuracy_score(y_train.iloc[va], pred))
+
+    accuracy = np.mean(scores)
+    feature_count = len(selected_cols)
+
+    return accuracy, feature_count
+
+toolbox.register("evaluate", eval_individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+toolbox.register("select", tools.selNSGA2)
+
+# ---------------------------------------------------------
+# Run NSGA-II Evolution
+# ---------------------------------------------------------
+pop = toolbox.population(n=80)
+NGEN = 30
+hof = tools.ParetoFront()  # stores non-dominated solutions
+
+print("\nRunning NSGA-II Multi Objective GA...")
+algorithms.eaMuPlusLambda(pop, toolbox,
+                          mu=80, lambda_=160,
+                          cxpb=0.6, mutpb=0.3,
+                          ngen=NGEN,
+                          stats=None, halloffame=hof, verbose=True)
+
+# ---------------------------------------------------------
+# Display Pareto Front
+# ---------------------------------------------------------
+pareto_acc = [ind.fitness.values[0] for ind in hof]
+pareto_feat = [ind.fitness.values[1] for ind in hof]
+
+plt.figure(figsize=(8,5))
+plt.scatter(pareto_feat, pareto_acc, c='blue')
+plt.xlabel("Number of Features (minimize)")
+plt.ylabel("Cross-Validated Accuracy (maximize)")
+plt.title("Pareto Front (NSGA-II)")
+plt.grid(True)
+plt.show()
+
+# ---------------------------------------------------------
+# Choose Best Solution from Pareto Front
+# Strategy:
+#    pick solution with highest accuracy
+# ---------------------------------------------------------
+best_ind = sorted(hof, key=lambda ind: ind.fitness.values[0], reverse=True)[0]
+
+selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+
+print("\nSelected Features:")
+print(selected_features)
+
+# ---------------------------------------------------------
+# Prepare Final Train/Test using selected features
+# ---------------------------------------------------------
+X_train_sel = X_train[selected_features].values
+X_test_sel = X_test[selected_features].values
+
+# ---------------------------------------------------------
+# Final Classifiers
+# ---------------------------------------------------------
+classifiers = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "XGBoost": xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', random_state=42),
+    "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=42)
+}
+
+# ---------------------------------------------------------
+# Evaluate on Unseen Test Set (20%)
+# ---------------------------------------------------------
+results = []
+
+for name, clf in classifiers.items():
+    print(f"\n============== {name} ==============")
+
+    clf.fit(X_train_sel, y_train)
+    y_pred = clf.predict(X_test_sel)
+    y_prob = clf.predict_proba(X_test_sel)[:, 1] if hasattr(clf, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float('nan')
+
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall   : {rec:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"AUC      : {auc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap='Blues')
+    plt.title(f"{name} - Confusion Matrix")
+    plt.show()
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1 Score": f1,
+        "AUC": auc
+    })
+
+print("\n========== FINAL TEST RESULTS (20% UNSEEN) ==========")
+print(pd.DataFrame(results))
