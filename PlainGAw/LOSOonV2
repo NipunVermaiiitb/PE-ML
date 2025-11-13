@@ -1,0 +1,335 @@
+import pandas as pd
+import numpy as np
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import PowerTransformer, StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+)
+from sklearn.model_selection import train_test_split
+
+from imblearn.over_sampling import SMOTE
+
+from deap import base, creator, tools, algorithms
+
+# Classifiers
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
+
+import matplotlib.pyplot as plt
+import joblib
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+
+# =====================================================================
+# 1. LOAD + KEEP SUBJECT_ID
+# =====================================================================
+def load_data(path):
+    df = pd.read_csv(path)
+
+    # DO NOT DROP Subject_ID
+    drop_cols = ['ApEn','scope','segment','SubjectID','SubjectName']
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+    df['label'] = df['condition'].map({
+        'Baseline': 0, 'Recovery': 0,
+        'Stroop': 1, 'MAT': 1
+    })
+    df = df.drop(columns=['condition'], errors='ignore')
+
+    y = df['label'].astype(int)
+    return df, y
+
+# =====================================================================
+# 2. DETECT SKEW
+# =====================================================================
+def detect_skew(X_train, threshold=0.75):
+    skew_vals = X_train.skew()
+    return skew_vals[skew_vals.abs() > threshold].index.tolist()
+
+# =====================================================================
+# 3. FIT PREPROCESSOR (IMPUTE → POWER → SCALE)
+# =====================================================================
+def fit_preprocessor(X_train, skew_cols):
+    imputer = SimpleImputer(strategy="median")
+    X_imp = pd.DataFrame(imputer.fit_transform(X_train),
+                         columns=X_train.columns)
+
+    power = None
+    X_pt = X_imp.copy()
+
+    if len(skew_cols) > 0:
+        power = PowerTransformer(method='yeo-johnson', standardize=False)
+        X_pt[skew_cols] = power.fit_transform(X_imp[skew_cols])
+
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X_pt),
+                            columns=X_pt.columns)
+
+    return {
+        "imputer": imputer,
+        "power": power,
+        "scaler": scaler,
+        "X_preprocessed": X_scaled
+    }
+
+# =====================================================================
+# 4. APPLY PREPROCESSOR TO NEW DATA
+# =====================================================================
+def transform_data(X, preproc):
+    imputer = preproc["imputer"]
+    power = preproc["power"]
+    scaler = preproc["scaler"]
+
+    X_imp = pd.DataFrame(imputer.transform(X), columns=X.columns)
+
+    X_pt = X_imp.copy()
+    if power is not None:
+        X_pt[power.feature_names_in_] = power.transform(X_imp[power.feature_names_in_])
+
+    X_scaled = pd.DataFrame(scaler.transform(X_pt), columns=X_pt.columns)
+    return X_scaled
+
+# =====================================================================
+# 5. CORRELATION FILTER
+# =====================================================================
+def correlation_filter(X_train, thr=0.95):
+    corr = X_train.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop_cols = [col for col in upper.columns if any(upper[col] > thr)]
+    return X_train.drop(columns=drop_cols), drop_cols
+
+# =====================================================================
+# 6. LOSO SPLITS FOR GA
+# =====================================================================
+def get_loso_splits(subject_ids):
+    """
+    subject_ids: pandas Series aligned with X_train
+    returns list of (train_index, val_index)
+    """
+    unique_subs = subject_ids.unique()
+    folds = []
+
+    for sub in unique_subs:
+        val_idx = subject_ids[subject_ids == sub].index.to_numpy()
+        train_idx = subject_ids[subject_ids != sub].index.to_numpy()
+        folds.append((train_idx, val_idx))
+
+    return folds
+
+# =====================================================================
+# 7. RESET DEAP
+# =====================================================================
+def reset_deap():
+    for name in ("FitnessMax", "Individual"):
+        if name in creator.__dict__:
+            delattr(creator, name)
+
+# =====================================================================
+# 8. GA FEATURE SELECTION WITH LOSO + PREPROCESSING INSIDE FOLDS
+# =====================================================================
+def run_ga_loso(X_train_raw, y_train, skew_cols, loso_folds,
+                gens=10, pop_size=60):
+
+    n_features = X_train_raw.shape[1]
+    feature_names = X_train_raw.columns.tolist()
+
+    reset_deap()
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+    toolbox = base.Toolbox()
+    toolbox.register("attr_bool", random.randint, 0, 1)
+    toolbox.register("individual", tools.initRepeat, creator.Individual,
+                     toolbox.attr_bool, n=n_features)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    def eval_ind(ind):
+        if sum(ind) == 0:
+            return 0.0,
+
+        selected = [feature_names[i] for i in range(n_features) if ind[i] == 1]
+
+        scores = []
+
+        for tr_idx, va_idx in loso_folds:
+            X_tr = X_train_raw.loc[tr_idx].copy()
+            X_va = X_train_raw.loc[va_idx].copy()
+            y_tr = y_train.loc[tr_idx]
+            y_va = y_train.loc[va_idx]
+
+            # FIT PREPROCESSOR ON TRAIN SUBJECTS ONLY
+            pp = fit_preprocessor(X_tr, skew_cols)
+
+            X_tr_pp = pp["X_preprocessed"]
+            X_va_pp = transform_data(X_va, pp)
+
+            # CORRELATION FILTER INSIDE LOSO FOLD
+            X_tr_cf, dropped = correlation_filter(X_tr_pp, thr=0.95)
+            X_va_cf = X_va_pp.drop(columns=dropped, errors='ignore')
+
+            # REDUCE TO SELECTED FEATURE SUBSET
+            X_tr_sel = X_tr_cf[selected]
+            X_va_sel = X_va_cf[selected]
+
+            # SMOTE on TRAIN SUBJECTS only
+            sm = SMOTE(random_state=RANDOM_STATE)
+            X_tr_res, y_tr_res = sm.fit_resample(X_tr_sel, y_tr)
+
+            # Train a simple model for GA fitness
+            rf = RandomForestClassifier(n_estimators=120, random_state=RANDOM_STATE)
+            rf.fit(X_tr_res, y_tr_res)
+
+            pred = rf.predict(X_va_sel)
+            scores.append(accuracy_score(y_va, pred))
+
+        return np.mean(scores),
+
+    # Register in DEAP
+    toolbox.register("evaluate", eval_ind)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    pop = toolbox.population(n=pop_size)
+    hof = tools.HallOfFame(1)
+
+    print("\n=== GA With LOSO Started ===")
+    for g in range(gens):
+        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+        fits = list(map(toolbox.evaluate, offspring))
+
+        for ind, fit in zip(offspring, fits):
+            ind.fitness.values = fit
+
+        pop = toolbox.select(offspring, len(pop))
+        hof.update(pop)
+        print(f"Gen {g+1}/{gens} | Best = {hof[0].fitness.values[0]:.4f}")
+
+    best_ind = hof[0]
+    selected_feats = [feature_names[i] for i in range(n_features) if best_ind[i] == 1]
+
+    return selected_feats
+
+# =====================================================================
+# 9. MAIN
+# =====================================================================
+def main():
+
+    df, y = load_data("/content/All_subjects_segments60.csv")
+
+    # Separate Subject_ID + features
+    subject_id = df["Subject_ID"]
+    X = df.drop(columns=["label"])
+
+    # Train-test split
+    X_train_raw, X_test_raw, y_train, y_test, sub_train, sub_test = train_test_split(
+        X, y, subject_id, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+    )
+
+    print("Train:", X_train_raw.shape, " Test:", X_test_raw.shape)
+
+    # Detect skew on TRAIN only
+    feature_cols = X_train_raw.columns.drop("Subject_ID")
+    skew_cols = detect_skew(X_train_raw[feature_cols])
+    print("Skewed columns:", skew_cols)
+
+    # Fit preprocessor on TRAIN
+    preproc = fit_preprocessor(X_train_raw[feature_cols], skew_cols)
+    X_train_pp = preproc["X_preprocessed"]
+    X_test_pp = transform_data(X_test_raw[feature_cols], preproc)
+
+    # Add Subject_ID back for LOSO
+    X_train_pp["Subject_ID"] = sub_train.values
+    X_test_pp["Subject_ID"] = sub_test.values
+
+    # Correlation filtering
+    X_train_pp_nosub = X_train_pp.drop(columns=["Subject_ID"])
+    X_train_cf, dropped = correlation_filter(X_train_pp_nosub, thr=0.95)
+    print("Dropped correlated:", dropped)
+
+    # Apply same drop to test
+    X_test_cf = X_test_pp.drop(columns=dropped + ["Subject_ID"], errors="ignore")
+
+    # LOSO folds for GA
+    loso_folds = get_loso_splits(sub_train)
+
+    # GA FEATURE SELECTION (with LOSO)
+    selected_feats = run_ga_loso(
+        X_train_raw=X_train_pp_nosub,
+        y_train=y_train,
+        skew_cols=skew_cols,
+        loso_folds=loso_folds,
+        gens=10,
+        pop_size=60
+    )
+
+    print("\nSelected Features:", selected_feats)
+
+    # Final train set
+    X_train_final = X_train_cf[selected_feats]
+    X_test_final = X_test_cf[selected_feats]
+
+    # Final SMOTE
+    sm = SMOTE(random_state=RANDOM_STATE)
+    X_train_bal, y_train_bal = sm.fit_resample(X_train_final, y_train)
+
+    # Classifiers
+    classifiers = {
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
+        "KNN": KNeighborsClassifier(),
+        "SVM": SVC(kernel='rbf', probability=True, random_state=RANDOM_STATE),
+        "Logistic": LogisticRegression(max_iter=600, random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric='logloss', random_state=RANDOM_STATE
+        ),
+        "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=RANDOM_STATE)
+    }
+
+    results = []
+    for name, clf in classifiers.items():
+        print(f"\n==== {name} ====")
+        clf.fit(X_train_bal, y_train_bal)
+
+        y_pred = clf.predict(X_test_final)
+        y_prob = clf.predict_proba(X_test_final)[:, 1] if hasattr(clf, "predict_proba") else None
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred)
+        rec = recall_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+        print(acc, prec, rec, f1, auc)
+
+        cm = confusion_matrix(y_test, y_pred)
+        ConfusionMatrixDisplay(cm).plot(cmap="Blues")
+        plt.show()
+
+        results.append({
+            "Model": name,
+            "Acc": acc,
+            "Prec": prec,
+            "Rec": rec,
+            "F1": f1,
+            "AUC": auc
+        })
+
+    print("\nFINAL RESULTS:")
+    print(pd.DataFrame(results))
+
+
+if __name__ == "__main__":
+    main()
