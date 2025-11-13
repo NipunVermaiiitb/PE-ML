@@ -1,0 +1,357 @@
+# improved_preprocessing_pipeline.py
+import pandas as pd
+import numpy as np
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import PowerTransformer, StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+)
+
+from imblearn.over_sampling import SMOTE
+from deap import base, creator, tools, algorithms
+
+# Classifiers
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
+
+import matplotlib.pyplot as plt
+import joblib
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+
+# ------------------------------
+# Utility / preprocessing funcs
+# ------------------------------
+def load_and_prepare_labels(path):
+    """Load CSV and prepare label column similar to original script."""
+    df = pd.read_csv(path)
+    drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+    # create binary label (matches your mapping)
+    df['label'] = df['condition'].map({
+        'Baseline': 0, 'Recovery': 0,
+        'Stroop': 1, 'MAT': 1
+    })
+    df = df.drop(columns=['condition'], errors='ignore')
+    X = df.drop(columns=['label'])
+    y = df['label'].astype(int)
+    return X, y
+
+def detect_skewed_columns(X_train, threshold=0.75):
+    """Return list of columns to apply PowerTransformer on (|skew| > threshold)."""
+    skewness = X_train.skew(numeric_only=True)
+    skewed = skewness[skewness.abs() > threshold].index.tolist()
+    return skewed
+
+def build_and_fit_preprocessor(X_train, skew_cols):
+    """
+    Fit imputer -> powertransform (for skewed) -> scaler on X_train.
+    Returns preprocessor objects and the transformed DataFrame.
+    """
+    # Imputer (median)
+    imputer = SimpleImputer(strategy="median")
+    X_imp = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns, index=X_train.index)
+
+    # PowerTransformer only for skewed cols (Yeo-Johnson handles negatives)
+    power = None
+    X_pt = X_imp.copy()
+    if len(skew_cols) > 0:
+        power = PowerTransformer(method='yeo-johnson', standardize=False)
+        X_pt_skewed = pd.DataFrame(
+            power.fit_transform(X_imp[skew_cols]),
+            columns=skew_cols,
+            index=X_imp.index
+        )
+        X_pt[skew_cols] = X_pt_skewed
+
+    # StandardScaler for all features
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X_pt), columns=X_pt.columns, index=X_pt.index)
+
+    return {
+        "imputer": imputer,
+        "power": power,
+        "scaler": scaler,
+        "X_preprocessed": X_scaled
+    }
+
+def transform_with_preprocessor(X, preproc):
+    """Apply a fitted preprocessor dict to X and return DataFrame with same columns."""
+    imputer = preproc["imputer"]
+    power = preproc["power"]
+    scaler = preproc["scaler"]
+
+    X_imp = pd.DataFrame(imputer.transform(X), columns=X.columns, index=X.index)
+
+    X_pt = X_imp.copy()
+    if power is not None:
+        # We must apply power.transform only to the columns it was fitted on.
+        # power was fitted on columns with same names as those passed earlier.
+        # Assuming same column set; otherwise subset.
+        cols_power = power.feature_names_in_ if hasattr(power, "feature_names_in_") else X_pt.columns
+        # But PowerTransformer when fit on subset will not have feature_names_in_. We stored skew_cols externally.
+        # For robustness, we try to apply transform to the intersection if attribute missing.
+        try:
+            cols_power = power.feature_names_in_
+        except Exception:
+            # fallback: assume power was fitted on columns with same names in preproc['skew_cols']
+            # We'll rely on power.n_features_in_ to detect length and take first N numeric columns in same order.
+            if hasattr(power, "n_features_in_") and power.n_features_in_ <= X_pt.shape[1]:
+                cols_power = X_pt.columns[: power.n_features_in_]
+            else:
+                cols_power = X_pt.columns
+        # apply transform
+        X_pt_subset = pd.DataFrame(
+            power.transform(X_imp[cols_power]),
+            columns=cols_power,
+            index=X_imp.index
+        )
+        X_pt[cols_power] = X_pt_subset
+
+    X_scaled = pd.DataFrame(scaler.transform(X_pt), columns=X_pt.columns, index=X_pt.index)
+    return X_scaled
+
+def correlation_filter_train(X_train, threshold=0.95):
+    """
+    Remove one of each highly correlated pair (abs(corr) > threshold).
+    Returns filtered DataFrame and list of removed columns.
+    """
+    corr_matrix = X_train.corr().abs()
+    # Upper triangle mask
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+    X_filtered = X_train.drop(columns=to_drop)
+    return X_filtered, to_drop
+
+# ------------------------------
+# GA utilities
+# ------------------------------
+def reset_deap_creator():
+    """If DEAP creator classes exist, delete them to allow re-creation."""
+    # Safe deletion if previously created in the session
+    for name in ("FitnessMax", "Individual"):
+        if name in creator.__dict__:
+            delattr(creator, name)
+
+def run_ga_feature_selection(X_train_np, y_train_series, n_gen=10, pop_size=60, cv_splits=5):
+    """
+    Genetic Algorithm to select features.
+    Important: X_train_np is a numpy array or DataFrame (preprocessed & filtered).
+    y_train_series is the corresponding pandas Series (labels).
+    GA evaluates each individual by performing CV where SMOTE is applied on each training fold.
+    Returns list of selected feature indices (and names if provided).
+    """
+    # Convert to DataFrame if needed so we can map indices to names
+    if isinstance(X_train_np, np.ndarray):
+        X_full = pd.DataFrame(X_train_np, columns=[f"f{i}" for i in range(X_train_np.shape[1])])
+    else:
+        X_full = X_train_np.copy()
+
+    n_features = X_full.shape[1]
+
+    # Reset DEAP classes and create
+    reset_deap_creator()
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+    toolbox = base.Toolbox()
+    toolbox.register("attr_bool", random.randint, 0, 1)
+    toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_bool, n=n_features)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    def eval_individual(individual):
+        # If no features selected, return worst
+        if sum(individual) == 0:
+            return 0.0,
+
+        selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
+        X_sub = X_full[selected_cols].values
+        cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+        scores = []
+        for tr_idx, va_idx in cv.split(X_sub, y_train_series):
+            X_tr, X_va = X_sub[tr_idx], X_sub[va_idx]
+            y_tr, y_va = y_train_series.iloc[tr_idx], y_train_series.iloc[va_idx]
+
+            # Apply SMOTE only on training fold
+            sm = SMOTE(random_state=RANDOM_STATE)
+            X_tr_res, y_tr_res = sm.fit_resample(X_tr, y_tr)
+
+            rf = RandomForestClassifier(n_estimators=150, random_state=RANDOM_STATE)
+            rf.fit(X_tr_res, y_tr_res)
+            pred = rf.predict(X_va)
+            scores.append(accuracy_score(y_va, pred))
+        return float(np.mean(scores)),
+
+    toolbox.register("evaluate", eval_individual)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    pop = toolbox.population(n=pop_size)
+    hof = tools.HallOfFame(1)
+
+    for gen in range(n_gen):
+        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+        fits = list(map(toolbox.evaluate, offspring))
+        for fit, ind in zip(fits, offspring):
+            ind.fitness.values = fit
+        pop = toolbox.select(offspring, len(pop))
+        hof.update(pop)
+        print(f"Gen {gen+1}/{n_gen} | Best Fitness = {hof[0].fitness.values[0]:.4f}")
+
+    best_ind = hof[0]
+    selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+    return selected_features
+
+# ------------------------------
+# Main flow
+# ------------------------------
+def main():
+    # --------------------------
+    # Load
+    # --------------------------
+    X, y = load_and_prepare_labels('/content/All_subjects_segments60.csv')
+    print(f"Original shape: X={X.shape}, y={y.shape}")
+
+    # --------------------------
+    # Train-test split (first)
+    # --------------------------
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+    )
+    print(f"After split -> Train: {X_train_raw.shape}, Test: {X_test_raw.shape}")
+
+    # --------------------------
+    # Detect skewed columns on TRAIN
+    # --------------------------
+    skew_threshold = 0.75
+    skew_cols = detect_skewed_columns(X_train_raw, threshold=skew_threshold)
+    print(f"Detected skewed columns (|skew| > {skew_threshold}): {skew_cols}")
+
+    # --------------------------
+    # Fit preprocessor on TRAIN
+    # --------------------------
+    preproc = build_and_fit_preprocessor(X_train_raw, skew_cols)
+    X_train_pp = preproc["X_preprocessed"]
+    # Keep consistent column order
+    X_test_pp = transform_with_preprocessor(X_test_raw, preproc)
+
+    print("Preprocessing fitted on train and applied to train/test.")
+
+    # --------------------------
+    # Correlation filtering (train-only)
+    # --------------------------
+    corr_threshold = 0.95
+    X_train_corr_filt, dropped_cols = correlation_filter_train(X_train_pp, threshold=corr_threshold)
+    print(f"Dropped {len(dropped_cols)} highly-correlated columns: {dropped_cols}")
+
+    # Apply same column drop to test
+    X_test_corr_filt = X_test_pp.drop(columns=dropped_cols, errors='ignore')
+
+    # --------------------------
+    # Now run GA for feature selection on the preprocessed+filtered train set.
+    # Important: run_ga applies SMOTE inside the CV folds to avoid leakage.
+    # --------------------------
+    print("\nRunning GA feature selection on preprocessed & correlation-filtered train data...")
+    selected_features = run_ga_feature_selection(X_train_corr_filt, y_train, n_gen=10, pop_size=60, cv_splits=5)
+
+    if len(selected_features) == 0:
+        print("GA returned 0 features. Falling back to all features after correlation filtering.")
+        selected_features = X_train_corr_filt.columns.tolist()
+
+    print("\nSelected GA Features:")
+    print(selected_features)
+
+    # --------------------------
+    # Prepare final train set for classifier training:
+    # - Use the preprocessed, correlation-filtered TRAIN set
+    # - Apply SMOTE once more on the entire training set (since final model will be trained on balanced data)
+    # - Train classifiers on this balanced set
+    # Note: SMOTE only on training set; test remains untouched.
+    # --------------------------
+    X_train_final = X_train_corr_filt[selected_features]
+    X_test_final = X_test_corr_filt[selected_features]
+
+    sm = SMOTE(random_state=RANDOM_STATE)
+    X_train_bal, y_train_bal = sm.fit_resample(X_train_final.values, y_train.values)
+    print(f"After SMOTE -> X_train: {X_train_bal.shape}, y_train: {np.bincount(y_train_bal)}")
+
+    # --------------------------
+    # Classifiers
+    # --------------------------
+    classifiers = {
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
+        "KNN": KNeighborsClassifier(),
+        "SVM": SVC(kernel='rbf', probability=True, random_state=RANDOM_STATE),
+        "Logistic": LogisticRegression(max_iter=600, random_state=RANDOM_STATE),
+        "XGBoost": xgb.XGBClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric='logloss', random_state=RANDOM_STATE
+        ),
+        "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=RANDOM_STATE)
+    }
+
+    results = []
+    for name, clf in classifiers.items():
+        print(f"\n===================== {name} =====================")
+        clf.fit(X_train_bal, y_train_bal)
+
+        y_pred = clf.predict(X_test_final.values)
+        y_prob = clf.predict_proba(X_test_final.values)[:, 1] if hasattr(clf, "predict_proba") else None
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+        print(f"Accuracy : {acc:.4f}")
+        print(f"Precision: {prec:.4f}")
+        print(f"Recall   : {rec:.4f}")
+        print(f"F1 Score : {f1:.4f}")
+        print(f"AUC      : {auc:.4f}")
+
+        cm = confusion_matrix(y_test, y_pred)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        disp.plot(cmap='Blues')
+        plt.title(f"{name} - Test Confusion Matrix")
+        plt.show()
+
+        results.append({
+            "Model": name,
+            "Accuracy": acc,
+            "Precision": prec,
+            "Recall": rec,
+            "F1 Score": f1,
+            "AUC": auc
+        })
+
+    df_res = pd.DataFrame(results)
+    print("\n=================== FINAL TEST RESULTS (20% UNSEEN) ===================")
+    print(df_res)
+
+    # --------------------------
+    # Optionally save preprocessing objects and selected feature list for deployment
+    # --------------------------
+    joblib.dump(preproc["imputer"], "imputer.joblib")
+    if preproc["power"] is not None:
+        joblib.dump(preproc["power"], "power_transformer.joblib")
+    joblib.dump(preproc["scaler"], "scaler.joblib")
+    joblib.dump(selected_features, "selected_features.joblib")
+    print("Saved preprocessor components and selected features to disk (joblib).")
+
+if __name__ == "__main__":
+    main()
