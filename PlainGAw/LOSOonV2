@@ -61,20 +61,27 @@ def detect_skew(X_train, threshold=0.75):
 # 3. FIT PREPROCESSOR (IMPUTE → POWER → SCALE)
 # =====================================================================
 def fit_preprocessor(X_train, skew_cols):
+    """
+    IMPORTANT: preserve the index of X_train when creating DataFrames so that
+    downstream code using original indices (LOSO) stays consistent.
+    """
     imputer = SimpleImputer(strategy="median")
     X_imp = pd.DataFrame(imputer.fit_transform(X_train),
-                         columns=X_train.columns)
+                         columns=X_train.columns,
+                         index=X_train.index)   # <-- preserve index
 
     power = None
     X_pt = X_imp.copy()
 
     if len(skew_cols) > 0:
         power = PowerTransformer(method='yeo-johnson', standardize=False)
-        X_pt[skew_cols] = power.fit_transform(X_imp[skew_cols])
+        # fit_transform returns an array in the same column order as X_imp[skew_cols]
+        X_pt.loc[:, skew_cols] = power.fit_transform(X_imp[skew_cols])
 
     scaler = StandardScaler()
     X_scaled = pd.DataFrame(scaler.fit_transform(X_pt),
-                            columns=X_pt.columns)
+                            columns=X_pt.columns,
+                            index=X_pt.index)   # <-- preserve index
 
     return {
         "imputer": imputer,
@@ -87,17 +94,22 @@ def fit_preprocessor(X_train, skew_cols):
 # 4. APPLY PREPROCESSOR TO NEW DATA
 # =====================================================================
 def transform_data(X, preproc):
+    """
+    Preserve index of incoming X when constructing DataFrames so index alignment keeps.
+    """
     imputer = preproc["imputer"]
     power = preproc["power"]
     scaler = preproc["scaler"]
 
-    X_imp = pd.DataFrame(imputer.transform(X), columns=X.columns)
+    X_imp = pd.DataFrame(imputer.transform(X), columns=X.columns, index=X.index)
 
     X_pt = X_imp.copy()
     if power is not None:
-        X_pt[power.feature_names_in_] = power.transform(X_imp[power.feature_names_in_])
+        # power.feature_names_in_ holds the feature names used for the transformer
+        cols = list(power.feature_names_in_)
+        X_pt.loc[:, cols] = power.transform(X_imp[cols])
 
-    X_scaled = pd.DataFrame(scaler.transform(X_pt), columns=X_pt.columns)
+    X_scaled = pd.DataFrame(scaler.transform(X_pt), columns=X_pt.columns, index=X_pt.index)
     return X_scaled
 
 # =====================================================================
@@ -114,8 +126,8 @@ def correlation_filter(X_train, thr=0.95):
 # =====================================================================
 def get_loso_splits(subject_ids):
     """
-    subject_ids: pandas Series aligned with X_train
-    returns list of (train_index, val_index)
+    subject_ids: pandas Series aligned with X_train (must have same indices)
+    returns list of (train_index, val_index) where indices are the original DataFrame indices
     """
     unique_subs = subject_ids.unique()
     folds = []
@@ -163,6 +175,7 @@ def run_ga_loso(X_train_raw, y_train, skew_cols, loso_folds,
         scores = []
 
         for tr_idx, va_idx in loso_folds:
+            # Use .loc with indices that match the preprocessed DataFrames (we preserved indices)
             X_tr = X_train_raw.loc[tr_idx].copy()
             X_va = X_train_raw.loc[va_idx].copy()
             y_tr = y_train.loc[tr_idx]
@@ -179,12 +192,24 @@ def run_ga_loso(X_train_raw, y_train, skew_cols, loso_folds,
             X_va_cf = X_va_pp.drop(columns=dropped, errors='ignore')
 
             # REDUCE TO SELECTED FEATURE SUBSET
+            # If a selected feature was dropped by correlation filter, skip this fold
+            missing_selected = [f for f in selected if f not in X_tr_cf.columns]
+            if len(missing_selected) > 0:
+                # penalize if selected features are missing due to correlation removal
+                scores.append(0.0)
+                continue
+
             X_tr_sel = X_tr_cf[selected]
             X_va_sel = X_va_cf[selected]
 
             # SMOTE on TRAIN SUBJECTS only
             sm = SMOTE(random_state=RANDOM_STATE)
-            X_tr_res, y_tr_res = sm.fit_resample(X_tr_sel, y_tr)
+            try:
+                X_tr_res, y_tr_res = sm.fit_resample(X_tr_sel, y_tr)
+            except ValueError:
+                # if SMOTE fails (e.g. only one class), penalize
+                scores.append(0.0)
+                continue
 
             # Train a simple model for GA fitness
             rf = RandomForestClassifier(n_estimators=120, random_state=RANDOM_STATE)
@@ -249,24 +274,24 @@ def main():
     X_train_pp = preproc["X_preprocessed"]
     X_test_pp = transform_data(X_test_raw[feature_cols], preproc)
 
-    # Add Subject_ID back for LOSO
-    X_train_pp["Subject_ID"] = sub_train.values
-    X_test_pp["Subject_ID"] = sub_test.values
+    # Add Subject_ID back for LOSO — use the Series so indices align
+    X_train_pp["Subject_ID"] = sub_train
+    X_test_pp["Subject_ID"] = sub_test
 
-    # Correlation filtering
+    # Correlation filtering (drop Subject_ID column first for filtering)
     X_train_pp_nosub = X_train_pp.drop(columns=["Subject_ID"])
     X_train_cf, dropped = correlation_filter(X_train_pp_nosub, thr=0.95)
     print("Dropped correlated:", dropped)
 
-    # Apply same drop to test
+    # Apply same drop to test (drop Subject_ID too)
     X_test_cf = X_test_pp.drop(columns=dropped + ["Subject_ID"], errors="ignore")
 
-    # LOSO folds for GA
+    # LOSO folds for GA — pass the Series aligned with X_train (has original indices)
     loso_folds = get_loso_splits(sub_train)
 
     # GA FEATURE SELECTION (with LOSO)
     selected_feats = run_ga_loso(
-        X_train_raw=X_train_pp_nosub,
+        X_train_raw=X_train_pp_nosub,   # NOTE: this keeps the original indices
         y_train=y_train,
         skew_cols=skew_cols,
         loso_folds=loso_folds,
