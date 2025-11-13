@@ -1,0 +1,211 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score
+)
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from deap import base, creator, tools, algorithms
+import random
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------
+# Load dataset
+# ---------------------------------------------------------
+df = pd.read_csv('/content/All_subjects_segments30.csv')
+
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+df['label'] = df['condition'].map({
+    'Baseline': 0, 'Recovery': 0,
+    'Stroop': 1, 'MAT': 1
+})
+df = df.drop(columns=['condition'], errors='ignore')
+
+X = df.drop(columns=['label'])
+y = df['label'].astype(int)
+
+# ---------------------------------------------------------
+# Train-test split FIRST
+# ---------------------------------------------------------
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+print(f"Train shape: {X_train_raw.shape}, Test shape: {X_test_raw.shape}")
+
+# ---------------------------------------------------------
+# Impute missing values (train → fit, test → transform)
+# ---------------------------------------------------------
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp  = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+# ---------------------------------------------------------
+# LOG TRANSFORM SKEWED FEATURES (train only)
+# ---------------------------------------------------------
+skew_threshold = 1.0  # You can change this
+skew_vals = X_train_imp.skew()
+
+skewed_features = skew_vals[abs(skew_vals) > skew_threshold].index.tolist()
+print("\nSkewed Features (log-transformed):")
+print(skewed_features)
+
+# apply log(1 + x)
+X_train_imp[skewed_features] = np.log1p(X_train_imp[skewed_features])
+X_test_imp[skewed_features]  = np.log1p(X_test_imp[skewed_features])
+
+# ---------------------------------------------------------
+# Scale (train → fit, test → transform)
+# ---------------------------------------------------------
+scaler = RobustScaler()
+X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test_scaled  = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+# ---------------------------------------------------------
+# GA FEATURE SELECTION (TRAIN DATA ONLY)
+# ---------------------------------------------------------
+X_full = X_train_scaled.copy()
+n_features = X_full.shape[1]
+
+# Reset DEAP classes
+if "FitnessMax" in creator.__dict__:
+    del creator.FitnessMax
+if "Individual" in creator.__dict__:
+    del creator.Individual
+
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual,
+                 toolbox.attr_bool, n=n_features)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+# Fitness = RF 5-fold CV on TRAIN ONLY
+def eval_individual(individual):
+    if sum(individual) == 0:
+        return 0.0,
+
+    selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
+    X_sub = X_full[selected_cols].values
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = []
+
+    for tr, va in cv.split(X_sub, y_train):
+        rf = RandomForestClassifier(n_estimators=120, random_state=42)
+        rf.fit(X_sub[tr], y_train.iloc[tr])
+        pred = rf.predict(X_sub[va])
+        scores.append(accuracy_score(y_train.iloc[va], pred))
+
+    return np.mean(scores),
+
+toolbox.register("evaluate", eval_individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+# GA loop
+pop = toolbox.population(n=60)
+hof_main = tools.HallOfFame(1)
+NGEN = 25
+
+for gen in range(NGEN):
+    offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+    fits = list(map(toolbox.evaluate, offspring))
+    for fit, ind in zip(fits, offspring):
+        ind.fitness.values = fit
+    pop = toolbox.select(offspring, len(pop))
+    hof_main.update(pop)
+    print(f"Gen {gen+1}/{NGEN} | Best Fitness = {hof_main[0].fitness.values[0]:.4f}")
+
+# Selected features
+best_ind = hof_main[0]
+selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+
+print("\nSelected GA Features:")
+print(selected_features)
+
+if len(selected_features) == 0:
+    print("GA selected zero features — using all.")
+    selected_features = X_full.columns.tolist()
+
+# ---------------------------------------------------------
+# Apply selected features to TRAIN & TEST
+# ---------------------------------------------------------
+X_train_sel = X_train_scaled[selected_features].values
+X_test_sel = X_test_scaled[selected_features].values
+
+# ---------------------------------------------------------
+# Classifiers
+# ---------------------------------------------------------
+classifiers = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "XGBoost": xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', random_state=42
+    ),
+    "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=42)
+}
+
+# ---------------------------------------------------------
+# Evaluate on Unseen Test Set
+# ---------------------------------------------------------
+results = []
+
+for name, clf in classifiers.items():
+    print(f"\n===================== {name} =====================")
+
+    clf.fit(X_train_sel, y_train)
+
+    y_pred = clf.predict(X_test_sel)
+    y_prob = clf.predict_proba(X_test_sel)[:, 1] if hasattr(clf, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall   : {rec:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"AUC      : {auc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap='Blues')
+    plt.title(f"{name} - Test Confusion Matrix")
+    plt.show()
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1 Score": f1,
+        "AUC": auc
+    })
+
+# Summary
+df_res = pd.DataFrame(results)
+print("\n=================== FINAL TEST RESULTS (20% UNSEEN) ===================")
+print(df_res)
