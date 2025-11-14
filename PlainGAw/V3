@@ -337,40 +337,63 @@ plt.grid(True)
 plt.show()
 
 # ======================================================
-# FEATURE FREQUENCY CHART SPLIT INTO 3 GROUPS
-# - We use `feature_frequency_population` (cumulative across gens & population)
-# - Map it to column names
+# FEATURE FREQUENCY CHART SPLIT INTO 3 GROUPS (HIGHLIGHT GA FEATURES)
 # ======================================================
+
 feature_freq_series = pd.Series(feature_frequency_population, index=X_full.columns)
 
-# filter for features present in each group (we already built lists earlier)
+# Lists of features present in each category
 time_present = [c for c in time_domain if c in feature_freq_series.index]
-freq_present = [c for c in freq_domain if c in feature_freq_series.index]
-nl_present = [c for c in nonlinear if c in feature_freq_series.index]
+freq_present = [c for c in frequency_domain if c in feature_freq_series.index]
+nl_present   = [c for c in nonlinear if c in feature_freq_series.index]
 
-# Plot three stacked subplots
-fig, axes = plt.subplots(3, 1, figsize=(14, 12), constrained_layout=True)
+# Convert selected_features to a set for fast lookup
+ga_selected_set = set(selected_features)
 
-# Time-domain subplot
-axes[0].bar(time_present, feature_freq_series.loc[time_present].values)
+def make_colors(feature_list):
+    """
+    Highlight GA-selected features:
+    - Gray for unselected
+    - 'tab:blue' for GA-selected
+    """
+    return [
+        "tab:blue" if feat in ga_selected_set else "lightgray"
+        for feat in feature_list
+    ]
+
+fig, axes = plt.subplots(3, 1, figsize=(14, 16), constrained_layout=True)
+
+# ----------------- Time-domain subplot -----------------
+colors = make_colors(time_present)
+axes[0].bar(time_present, feature_freq_series.loc[time_present].values, color=colors)
 axes[0].set_title("GA Feature Selection Frequency — Time-domain")
 axes[0].set_ylabel("Selection Count")
 axes[0].tick_params(axis='x', rotation=90)
 
-# Frequency-domain subplot
-axes[1].bar(freq_present, feature_freq_series.loc[freq_present].values)
+# Annotation for legend
+axes[0].plot([], [], color="tab:blue", label="GA Selected")
+axes[0].plot([], [], color="lightgray", label="Not Selected")
+axes[0].legend()
+
+# ----------------- Frequency-domain subplot -----------------
+colors = make_colors(freq_present)
+axes[1].bar(freq_present, feature_freq_series.loc[freq_present].values, color=colors)
 axes[1].set_title("GA Feature Selection Frequency — Frequency-domain")
 axes[1].set_ylabel("Selection Count")
 axes[1].tick_params(axis='x', rotation=90)
 
-# Nonlinear subplot
-axes[2].bar(nl_present, feature_freq_series.loc[nl_present].values)
+axes[1].legend(["GA Selected", "Not Selected"])
+
+# ----------------- Nonlinear subplot -----------------
+colors = make_colors(nl_present)
+axes[2].bar(nl_present, feature_freq_series.loc[nl_present].values, color=colors)
 axes[2].set_title("GA Feature Selection Frequency — Nonlinear")
 axes[2].set_ylabel("Selection Count")
 axes[2].tick_params(axis='x', rotation=90)
 
-plt.show()
+axes[2].legend(["GA Selected", "Not Selected"])
 
+plt.show()
 # ======================================================
 # FEATURE TIMELINE HEATMAP (best-individual each gen)
 # ======================================================
