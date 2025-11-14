@@ -1,0 +1,449 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+)
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from deap import base, creator, tools, algorithms
+import random
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import warnings
+warnings.filterwarnings("ignore")
+
+# For dimensionality reduction
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# ======================================================
+# Load dataset
+# ======================================================
+df = pd.read_csv('/content/All_subjects_segments60.csv')
+
+# user-provided drop cols (kept same as earlier)
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+# create binary label
+df['label'] = df['condition'].map({
+    'Baseline': 0, 'Recovery': 0,
+    'Stroop': 1, 'MAT': 1
+})
+df = df.drop(columns=['condition'], errors='ignore')
+
+# ======================================================
+# Feature name lists (map to actual column names you provided)
+# ======================================================
+# User's actual df.columns (you pasted earlier)
+print("Columns in dataset:")
+print(list(df.columns))
+
+# We'll define the desired logical groups and map them to actual column names present in the dataframe.
+time_domain_expected = [
+    "AVNN_ms", "SDNN_ms", "RMSSD_ms", "NN50", "pNN50_pct", "NN20", "pNN20_pct",
+    "IQR_RR_ms", "MAD_RR_ms", "CVNN", "CVSD", "HR_mean_bpm", "HR_std_bpm", "HR_median_bpm"
+]
+
+frequency_domain_expected = [
+    "VLF_ms2", "LF_ms2", "HF_ms2", "TP_ms2", "LF_nu", "HF_nu", "LF_HF", "HF_LF",
+    "lnVLF", "lnLF", "lnHF", "lnTP", "fpeak_LF", "fpeak_HF", "fc_LF", "fc_HF",
+    "VLF_pct", "LF_pct", "HF_pct", "relative-TP"
+]
+
+nonlinear_expected = [
+    "SD1_ms", "SD2_ms", "SD1_SD2_ratio", "SampEn", "ApEn", "HiguchiFD", "KURT", "DFA-α1"
+]
+
+# Check which of the expected are actually present; create three lists of existing columns
+time_domain = [c for c in time_domain_expected if c in df.columns]
+freq_domain = [c for c in frequency_domain_expected if c in df.columns]
+nonlinear = [c for c in nonlinear_expected if c in df.columns]
+
+# Print warnings for missing expected columns
+missing_time = set(time_domain_expected) - set(time_domain)
+missing_freq = set(frequency_domain_expected) - set(freq_domain)
+missing_nl = set(nonlinear_expected) - set(nonlinear)
+
+if missing_time:
+    print("Warning - time-domain expected but missing:", missing_time)
+if missing_freq:
+    print("Warning - frequency-domain expected but missing:", missing_freq)
+if missing_nl:
+    print("Warning - nonlinear expected but missing:", missing_nl)
+
+# Note: continue with whichever of these exist in the dataframe.
+all_expected_features = time_domain + freq_domain + nonlinear
+print(f"Total expected features found from groups: {len(all_expected_features)}")
+
+# ======================================================
+# Split (train/test) FIRST to avoid leakage
+# ======================================================
+X = df.drop(columns=['label'])
+y = df['label'].astype(int)
+
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+print(f"Train shape: {X_train_raw.shape}, Test shape: {X_test_raw.shape}")
+
+# ======================================================
+# Impute (median) - fit on train, apply to test
+# ======================================================
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+# ======================================================
+# LOG TRANSFORM SKEWED FEATURES (train-only fit -> apply to test)
+# - detect skewness on training data (after impute), use abs(skew) > 1
+# - apply sign-preserving log1p: sign(x) * log1p(abs(x))
+# ======================================================
+skewness = X_train_imp.skew(numeric_only=True)
+skewed_cols = skewness[skewness.abs() > 1].index.tolist()
+print("Detected skewed columns (|skew| > 1):", skewed_cols)
+
+# We'll transform only numeric columns and those present in skewed_cols
+def sign_log1p_train_apply(train_series, test_series):
+    """
+    Apply sign-preserving log1p on train series, and same transformation on test.
+    Implementation: train_transformed = sign(x) * log1p(abs(x))
+    We simply apply identical function to test values (no 'fitting' params).
+    """
+    tr = train_series.copy()
+    te = test_series.copy()
+    tr_trans = np.sign(tr) * np.log1p(np.abs(tr))
+    te_trans = np.sign(te) * np.log1p(np.abs(te))
+    return tr_trans, te_trans
+
+for col in skewed_cols:
+    if col in X_train_imp.columns:
+        tr_col, te_col = sign_log1p_train_apply(X_train_imp[col].astype(float), X_test_imp[col].astype(float))
+        X_train_imp[col] = tr_col
+        X_test_imp[col] = te_col
+
+# ======================================================
+# Scale (RobustScaler) - fit on train, apply to test
+# ======================================================
+scaler = RobustScaler()
+X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test_scaled = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+# ======================================================
+# GA Feature Selection on TRAIN ONLY (same approach as before)
+# ======================================================
+X_full = X_train_scaled.copy()
+n_features = X_full.shape[1]
+
+# Reset DEAP classes safely
+if "FitnessMax" in creator.__dict__:
+    del creator.FitnessMax
+if "Individual" in creator.__dict__:
+    del creator.Individual
+
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual,
+                 toolbox.attr_bool, n=n_features)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+# Use cross_val_score inside fitness to be cleaner/faster
+def eval_individual(individual):
+    if sum(individual) == 0:
+        return 0.0,
+    selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
+    X_sub = X_full[selected_cols].values
+
+    clf = RandomForestClassifier(n_estimators=150, random_state=42)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cross_val_score(clf, X_sub, y_train, cv=cv, scoring='accuracy', n_jobs=1)
+    return scores.mean(),
+
+toolbox.register("evaluate", eval_individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+# GA tracking arrays
+pop = toolbox.population(n=60)
+hof_main = tools.HallOfFame(1)
+NGEN = 10
+
+best_train_fitness = []
+best_test_accuracy = []
+population_diversity = []
+feature_selection_history = []
+feature_frequency_population = np.zeros(n_features, dtype=int)
+
+for gen in range(NGEN):
+    offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+
+    # Evaluate offspring
+    fits = list(map(toolbox.evaluate, offspring))
+    for fit, ind in zip(fits, offspring):
+        ind.fitness.values = fit
+
+    # Select next generation
+    pop = toolbox.select(offspring, len(pop))
+    hof_main.update(pop)
+
+    # Best individual and tracking
+    best_ind = hof_main[0]
+    best_fit = best_ind.fitness.values[0]
+    best_train_fitness.append(best_fit)
+
+    pop_matrix = np.array([np.array(ind, dtype=int) for ind in pop])
+    # update cumulative feature frequency over whole population & gens
+    feature_frequency_population += pop_matrix.sum(axis=0)
+
+    # diversity (average pairwise Hamming distance)
+    pop_size = pop_matrix.shape[0]
+    if pop_size > 1:
+        dists = []
+        for i in range(pop_size):
+            for j in range(i+1, pop_size):
+                dists.append(np.sum(pop_matrix[i] != pop_matrix[j]) / n_features)
+        population_diversity.append(np.mean(dists))
+    else:
+        population_diversity.append(0.0)
+
+    # save best individual's bitmask
+    feature_selection_history.append(np.array(best_ind, dtype=int))
+
+    # Evaluate test accuracy for best individual of this gen
+    selected_cols = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+    if len(selected_cols) == 0:
+        selected_cols = X_full.columns.tolist()
+
+    Xtr_sel = X_train_scaled[selected_cols].values
+    Xte_sel = X_test_scaled[selected_cols].values
+
+    rf_tmp = RandomForestClassifier(n_estimators=150, random_state=42)
+    rf_tmp.fit(Xtr_sel, y_train)
+    y_pred_test = rf_tmp.predict(Xte_sel)
+    test_acc = accuracy_score(y_test, y_pred_test)
+    best_test_accuracy.append(test_acc)
+
+    print(f"Gen {gen+1}/{NGEN} | Best Fitness = {best_fit:.4f} | TestAcc (best_ind) = {test_acc:.4f}")
+
+# Final selected features from hall-of-fame
+best_ind = hof_main[0]
+selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+print("\nSelected GA Features:")
+print(selected_features)
+if len(selected_features) == 0:
+    print("GA selected zero features — using all.")
+    selected_features = X_full.columns.tolist()
+
+# Prepare selected train/test arrays
+X_train_sel = X_train_scaled[selected_features].values
+X_test_sel = X_test_scaled[selected_features].values
+
+# ======================================================
+# Classifiers
+# ======================================================
+classifiers = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "XGBoost": xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', use_label_encoder=False, random_state=42
+    ),
+    "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=42)
+}
+
+# Evaluate on Test Set & store fitted models for ROC/SHAP if needed
+results = []
+fitted_classifiers = {}
+
+for name, clf in classifiers.items():
+    print(f"\n===================== {name} =====================")
+    clf.fit(X_train_sel, y_train)
+    fitted_classifiers[name] = clf
+
+    y_pred = clf.predict(X_test_sel)
+    y_prob = clf.predict_proba(X_test_sel)[:, 1] if hasattr(clf, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall   : {rec:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"AUC      : {auc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap='Blues')
+    plt.title(f"{name} - Test Confusion Matrix")
+    plt.show()
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1 Score": f1,
+        "AUC": auc
+    })
+
+df_res = pd.DataFrame(results)
+print("\n=================== FINAL TEST RESULTS (20% UNSEEN) ===================")
+print(df_res)
+
+# ======================================================
+# PLOTS (GA convergence, popul diversity, train vs test)
+# ======================================================
+plt.figure(figsize=(7,5))
+plt.plot(best_train_fitness, marker='o', label='Best Train CV Fitness')
+plt.title("GA Convergence Curve (Train CV Fitness)")
+plt.xlabel("Generation")
+plt.ylabel("Best Fitness (Train CV Accuracy)")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(7,5))
+plt.plot(best_train_fitness, marker='o', label="Train CV Accuracy (best_ind)")
+plt.plot(best_test_accuracy, marker='s', label="Test Accuracy (best_ind)")
+plt.title("Train vs Test Accuracy per GA Generation")
+plt.xlabel("Generation")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(7,5))
+plt.plot(population_diversity, marker='o')
+plt.title("Population Diversity Curve (Average Hamming Distance)")
+plt.xlabel("Generation")
+plt.ylabel("Average Diversity (Hamming)")
+plt.grid(True)
+plt.show()
+
+# ======================================================
+# FEATURE FREQUENCY CHART SPLIT INTO 3 GROUPS
+# - We use `feature_frequency_population` (cumulative across gens & population)
+# - Map it to column names
+# ======================================================
+feature_freq_series = pd.Series(feature_frequency_population, index=X_full.columns)
+
+# filter for features present in each group (we already built lists earlier)
+time_present = [c for c in time_domain if c in feature_freq_series.index]
+freq_present = [c for c in freq_domain if c in feature_freq_series.index]
+nl_present = [c for c in nonlinear if c in feature_freq_series.index]
+
+# Plot three stacked subplots
+fig, axes = plt.subplots(3, 1, figsize=(14, 12), constrained_layout=True)
+
+# Time-domain subplot
+axes[0].bar(time_present, feature_freq_series.loc[time_present].values)
+axes[0].set_title("GA Feature Selection Frequency — Time-domain")
+axes[0].set_ylabel("Selection Count")
+axes[0].tick_params(axis='x', rotation=90)
+
+# Frequency-domain subplot
+axes[1].bar(freq_present, feature_freq_series.loc[freq_present].values)
+axes[1].set_title("GA Feature Selection Frequency — Frequency-domain")
+axes[1].set_ylabel("Selection Count")
+axes[1].tick_params(axis='x', rotation=90)
+
+# Nonlinear subplot
+axes[2].bar(nl_present, feature_freq_series.loc[nl_present].values)
+axes[2].set_title("GA Feature Selection Frequency — Nonlinear")
+axes[2].set_ylabel("Selection Count")
+axes[2].tick_params(axis='x', rotation=90)
+
+plt.show()
+
+# ======================================================
+# FEATURE TIMELINE HEATMAP (best-individual each gen)
+# ======================================================
+fs_hist = np.array(feature_selection_history)  # shape (NGEN, n_features)
+plt.figure(figsize=(12, max(4, n_features * 0.12)))
+plt.imshow(fs_hist.T, aspect='auto', cmap='Greens', interpolation='nearest')
+plt.colorbar(label='Selected (1 = selected)')
+plt.yticks(range(n_features), X_full.columns)
+plt.xticks(range(NGEN), [f"Gen{g+1}" for g in range(NGEN)], rotation=45)
+plt.xlabel("Generation")
+plt.ylabel("Feature")
+plt.title("Feature Selection Timeline Heatmap (best individual each gen)")
+plt.tight_layout()
+plt.show()
+
+# ======================================================
+# ROC Curve Overlay
+# ======================================================
+plt.figure(figsize=(8,6))
+plotted_any = False
+for name, clf in fitted_classifiers.items():
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(X_test_sel)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, probs)
+        plt.plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_test, probs):.3f})")
+        plotted_any = True
+
+if plotted_any:
+    plt.plot([0,1],[0,1],'k--', alpha=0.6)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve Comparison Across Classifiers")
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.show()
+else:
+    print("No classifier provided probability estimates for ROC plotting.")
+
+# ======================================================
+# PCA and t-SNE: Before vs After GA
+# ======================================================
+pca = PCA(n_components=2, random_state=42)
+pca_before = pca.fit_transform(X_train_scaled.values)
+plt.figure(figsize=(7,5))
+plt.scatter(pca_before[:,0], pca_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("PCA - Before GA Feature Selection")
+plt.xlabel("PC1"); plt.ylabel("PC2")
+plt.colorbar(label='label')
+plt.show()
+
+pca_after = PCA(n_components=2, random_state=42).fit_transform(X_train_sel)
+plt.figure(figsize=(7,5))
+plt.scatter(pca_after[:,0], pca_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("PCA - After GA Feature Selection")
+plt.xlabel("PC1"); plt.ylabel("PC2")
+plt.colorbar(label='label')
+plt.show()
+
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
+tsne_before = tsne.fit_transform(X_train_scaled.values)
+plt.figure(figsize=(7,5))
+plt.scatter(tsne_before[:,0], tsne_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("t-SNE - Before GA Feature Selection")
+plt.colorbar(label='label')
+plt.show()
+
+tsne_after = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
+tsne_after = tsne_after.fit_transform(X_train_sel)
+plt.figure(figsize=(7,5))
+plt.scatter(tsne_after[:,0], tsne_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("t-SNE - After GA Feature Selection")
+plt.colorbar(label='label')
+plt.show()
