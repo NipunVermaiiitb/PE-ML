@@ -1,0 +1,371 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+)
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from deap import base, creator, tools, algorithms
+import random
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import warnings
+warnings.filterwarnings("ignore")
+
+# For dimensionality reduction
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# --------------------------
+# Load dataset
+# --------------------------
+df = pd.read_csv('/content/All_subjects_segments60.csv')
+
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+# Create binary label (adjust mapping if needed)
+df['label'] = df['condition'].map({
+    'Baseline': 0, 'Recovery': 0,
+    'Stroop': 1, 'MAT': 1
+})
+df = df.drop(columns=['condition'], errors='ignore')
+
+X = df.drop(columns=['label'])
+y = df['label'].astype(int)
+
+# --------------------------
+# Train-test split FIRST (prevent leakage)
+# --------------------------
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+print(f"Train shape: {X_train_raw.shape}, Test shape: {X_test_raw.shape}")
+
+# --------------------------
+# Impute + Scale TRAIN ONLY
+# --------------------------
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+scaler = RobustScaler()
+X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test_scaled = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+# --------------------------
+# GA Feature Selection ON TRAIN DATA ONLY
+# --------------------------
+X_full = X_train_scaled.copy()
+n_features = X_full.shape[1]
+
+# Reset DEAP classes (safe re-create)
+if "FitnessMax" in creator.__dict__:
+    del creator.FitnessMax
+if "Individual" in creator.__dict__:
+    del creator.Individual
+
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual,
+                 toolbox.attr_bool, n=n_features)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+# Fitness = RF 5-fold CV on TRAIN SET ONLY
+def eval_individual(individual):
+    if sum(individual) == 0:
+        return 0.0,
+    selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
+    X_sub = X_full[selected_cols].values
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = []
+    for tr, va in cv.split(X_sub, y_train):
+        rf = RandomForestClassifier(n_estimators=150, random_state=42)
+        rf.fit(X_sub[tr], y_train.iloc[tr])
+        pred = rf.predict(X_sub[va])
+        scores.append(accuracy_score(y_train.iloc[va], pred))
+
+    return np.mean(scores),
+
+toolbox.register("evaluate", eval_individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+# --------------------------
+# GA loop + tracking
+# --------------------------
+pop = toolbox.population(n=60)
+hof_main = tools.HallOfFame(1)
+NGEN = 10
+
+# Tracking structures
+best_train_fitness = []               # best CV fitness per gen
+best_test_accuracy = []               # test accuracy for best individual per gen
+population_diversity = []             # avg pairwise Hamming distance per gen
+feature_selection_history = []        # best individual (0/1) per gen
+feature_frequency_population = np.zeros(n_features)  # cumulative population frequency across gens
+
+for gen in range(NGEN):
+    # Variation
+    offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+
+    # Evaluate offspring
+    fits = list(map(toolbox.evaluate, offspring))
+    for fit, ind in zip(fits, offspring):
+        ind.fitness.values = fit
+
+    # Selection -> new population
+    pop = toolbox.select(offspring, len(pop))
+    hof_main.update(pop)
+
+    # Best individual and its fitness (on current population)
+    best_ind = hof_main[0]
+    best_fit = best_ind.fitness.values[0]
+    best_train_fitness.append(best_fit)
+
+    # Compute population matrix as int array (pop_size x n_features)
+    pop_matrix = np.array([np.array(ind, dtype=int) for ind in pop])  # shape (pop_size, n_features)
+
+    # Update population-level feature frequency
+    feature_frequency_population += pop_matrix.sum(axis=0)
+
+    # Average pairwise Hamming distance (diversity)
+    pop_size = pop_matrix.shape[0]
+    if pop_size > 1:
+        # compute pairwise distances
+        dists = []
+        for i in range(pop_size):
+            for j in range(i+1, pop_size):
+                hd = np.sum(pop_matrix[i] != pop_matrix[j]) / n_features
+                dists.append(hd)
+        population_diversity.append(np.mean(dists))
+    else:
+        population_diversity.append(0.0)
+
+    # Save best individual's bitmask for timeline heatmap
+    feature_selection_history.append(np.array(best_ind, dtype=int))
+
+    # Evaluate test accuracy of best_ind (using RF on selected features)
+    selected_cols = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+    if len(selected_cols) == 0:
+        selected_cols = X_full.columns.tolist()
+    Xtr_sel = X_train_scaled[selected_cols].values
+    Xte_sel = X_test_scaled[selected_cols].values
+
+    rf_tmp = RandomForestClassifier(n_estimators=150, random_state=42)
+    rf_tmp.fit(Xtr_sel, y_train)
+    y_pred_test = rf_tmp.predict(Xte_sel)
+    test_acc = accuracy_score(y_test, y_pred_test)
+    best_test_accuracy.append(test_acc)
+
+    print(f"Gen {gen+1}/{NGEN} | Best Fitness = {best_fit:.4f} | TestAcc (best_ind) = {test_acc:.4f}")
+
+# Selected features: final best individual from HOF
+best_ind = hof_main[0]
+selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+print("\nSelected GA Features:")
+print(selected_features)
+if len(selected_features) == 0:
+    print("GA selected zero features — using all.")
+    selected_features = X_full.columns.tolist()
+
+# Apply selected features to TRAIN & TEST
+X_train_sel = X_train_scaled[selected_features].values
+X_test_sel = X_test_scaled[selected_features].values
+
+# --------------------------
+# Classifiers (same as before)
+# --------------------------
+classifiers = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "XGBoost": xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', random_state=42
+    ),
+    "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=42)
+}
+
+# Evaluate on Unseen Test Set and store fitted models for ROC
+results = []
+fitted_classifiers = {}
+
+for name, clf in classifiers.items():
+    print(f"\n===================== {name} =====================")
+    clf.fit(X_train_sel, y_train)
+    fitted_classifiers[name] = clf
+
+    y_pred = clf.predict(X_test_sel)
+    y_prob = clf.predict_proba(X_test_sel)[:, 1] if hasattr(clf, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall   : {rec:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"AUC      : {auc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap='Blues')
+    plt.title(f"{name} - Test Confusion Matrix")
+    plt.show()
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1 Score": f1,
+        "AUC": auc
+    })
+
+df_res = pd.DataFrame(results)
+print("\n=================== FINAL TEST RESULTS (20% UNSEEN) ===================")
+print(df_res)
+
+# --------------------------
+# PLOTS: GA Convergence & Train vs Test Accuracy
+# --------------------------
+plt.figure(figsize=(7,5))
+plt.plot(best_train_fitness, marker='o', label='Best Train CV Fitness')
+plt.title("GA Convergence Curve (Train CV Fitness)")
+plt.xlabel("Generation")
+plt.ylabel("Best Fitness (Train CV Accuracy)")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(7,5))
+plt.plot(best_train_fitness, marker='o', label="Train CV Accuracy (best_ind)")
+plt.plot(best_test_accuracy, marker='s', label="Test Accuracy (best_ind)")
+plt.title("Train vs Test Accuracy per GA Generation")
+plt.xlabel("Generation")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --------------------------
+# Population Diversity Curve
+# --------------------------
+plt.figure(figsize=(7,5))
+plt.plot(population_diversity, marker='o')
+plt.title("Population Diversity Curve (Average Hamming Distance)")
+plt.xlabel("Generation")
+plt.ylabel("Average Diversity (Hamming)")
+plt.grid(True)
+plt.show()
+
+# --------------------------
+# Feature Selection Timeline Heatmap (features x generations)
+# --------------------------
+fs_hist = np.array(feature_selection_history)  # shape (NGEN, n_features)
+plt.figure(figsize=(12, max(4, n_features * 0.12)))
+plt.imshow(fs_hist.T, aspect='auto', cmap='Greens', interpolation='nearest')
+plt.colorbar(label='Selected (1 = selected)')
+plt.yticks(range(n_features), X_full.columns)
+plt.xticks(range(NGEN), [f"Gen{g+1}" for g in range(NGEN)], rotation=45)
+plt.xlabel("Generation")
+plt.ylabel("Feature")
+plt.title("Feature Selection Timeline Heatmap (best individual each gen)")
+plt.tight_layout()
+plt.show()
+
+# --------------------------
+# Feature frequency across entire population (bar)
+# --------------------------
+plt.figure(figsize=(12,5))
+plt.bar(X_full.columns, feature_frequency_population)
+plt.xticks(rotation=90)
+plt.title("Feature Selection Frequency Across Entire Population (sum over gens & pop)")
+plt.ylabel("Selection Count")
+plt.tight_layout()
+plt.show()
+
+# --------------------------
+# ROC Curve Overlay for all fitted classifiers
+# --------------------------
+plt.figure(figsize=(8,6))
+plotted_any = False
+for name, clf in fitted_classifiers.items():
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(X_test_sel)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, probs)
+        plt.plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_test, probs):.3f})")
+        plotted_any = True
+
+if plotted_any:
+    plt.plot([0,1],[0,1],'k--', alpha=0.6)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve Comparison Across Classifiers")
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.show()
+else:
+    print("No classifier provided probability estimates for ROC plotting.")
+
+# --------------------------
+# PCA and t-SNE: Before vs After GA
+# --------------------------
+# PCA before
+pca = PCA(n_components=2, random_state=42)
+pca_before = pca.fit_transform(X_train_scaled.values)
+
+plt.figure(figsize=(7,5))
+plt.scatter(pca_before[:,0], pca_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("PCA - Before GA Feature Selection")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.colorbar(label='label')
+plt.show()
+
+# PCA after
+pca_after = PCA(n_components=2, random_state=42).fit_transform(X_train_sel)
+plt.figure(figsize=(7,5))
+plt.scatter(pca_after[:,0], pca_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("PCA - After GA Feature Selection")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.colorbar(label='label')
+plt.show()
+
+# t-SNE before
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
+tsne_before = tsne.fit_transform(X_train_scaled.values)
+plt.figure(figsize=(7,5))
+plt.scatter(tsne_before[:,0], tsne_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("t-SNE - Before GA Feature Selection")
+plt.colorbar(label='label')
+plt.show()
+
+# t-SNE after
+tsne_after = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
+tsne_after = tsne_after.fit_transform(X_train_sel)
+plt.figure(figsize=(7,5))
+plt.scatter(tsne_after[:,0], tsne_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
+plt.title("t-SNE - After GA Feature Selection")
+plt.colorbar(label='label')
+plt.show()
