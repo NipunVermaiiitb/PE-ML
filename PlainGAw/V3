@@ -40,48 +40,45 @@ df['label'] = df['condition'].map({
 df = df.drop(columns=['condition'], errors='ignore')
 
 # ======================================================
-# Feature name lists (map to actual column names you provided)
+# Feature Categories Based on Actual Dataset Columns
 # ======================================================
-# User's actual df.columns (you pasted earlier)
-print("Columns in dataset:")
-print(list(df.columns))
 
-# We'll define the desired logical groups and map them to actual column names present in the dataframe.
-time_domain_expected = [
-    "AVNN_ms", "SDNN_ms", "RMSSD_ms", "NN50", "pNN50_pct", "NN20", "pNN20_pct",
-    "IQR_RR_ms", "MAD_RR_ms", "CVNN", "CVSD", "HR_mean_bpm", "HR_std_bpm", "HR_median_bpm"
+time_domain = [
+    "AVNN_ms", "MEDIAN_RR_ms", "SDNN_ms", "RMSSD_ms", "SDSD_ms",
+    "NN20", "pNN20_pct", "NN50", "pNN50_pct",
+    "HR_mean_bpm", "HR_std_bpm", "HR_median_bpm",
+    "IQR_RR_ms", "MAD_RR_ms", "CVNN", "CVSD"
 ]
 
-frequency_domain_expected = [
-    "VLF_ms2", "LF_ms2", "HF_ms2", "TP_ms2", "LF_nu", "HF_nu", "LF_HF", "HF_LF",
-    "lnVLF", "lnLF", "lnHF", "lnTP", "fpeak_LF", "fpeak_HF", "fc_LF", "fc_HF",
-    "VLF_pct", "LF_pct", "HF_pct", "relative-TP"
+frequency_domain = [
+    "VLF_ms2", "LF_ms2", "HF_ms2", "TP_ms2",
+    "LF_nu", "HF_nu", "LF_HF", "HF_LF",
+    "lnLF", "lnHF", "lnTP",
+    "VLF_pct", "LF_pct", "HF_pct",
+    "fpeak_LF", "fpeak_HF", "fc_LF", "fc_HF"
 ]
 
-nonlinear_expected = [
-    "SD1_ms", "SD2_ms", "SD1_SD2_ratio", "SampEn", "ApEn", "HiguchiFD", "KURT", "DFA-α1"
+nonlinear = [
+    "SD1_ms", "SD2_ms", "SD1_SD2_ratio",
+    "SampEn", "HiguchiFD", "KURT"
 ]
 
-# Check which of the expected are actually present; create three lists of existing columns
-time_domain = [c for c in time_domain_expected if c in df.columns]
-freq_domain = [c for c in frequency_domain_expected if c in df.columns]
-nonlinear = [c for c in nonlinear_expected if c in df.columns]
+other_features = ["N", "SKEW", "TI"]
 
-# Print warnings for missing expected columns
-missing_time = set(time_domain_expected) - set(time_domain)
-missing_freq = set(frequency_domain_expected) - set(freq_domain)
-missing_nl = set(nonlinear_expected) - set(nonlinear)
+# Keep only features that actually exist in df
+time_domain = [c for c in time_domain if c in df.columns]
+frequency_domain = [c for c in frequency_domain if c in df.columns]
+nonlinear = [c for c in nonlinear if c in df.columns]
+other_features = [c for c in other_features if c in df.columns]
 
-if missing_time:
-    print("Warning - time-domain expected but missing:", missing_time)
-if missing_freq:
-    print("Warning - frequency-domain expected but missing:", missing_freq)
-if missing_nl:
-    print("Warning - nonlinear expected but missing:", missing_nl)
+print("\n=== FINAL FEATURE CATEGORY COUNTS ===")
+print("Time-domain:", len(time_domain))
+print("Frequency-domain:", len(frequency_domain))
+print("Nonlinear:", len(nonlinear))
+print("Other:", len(other_features))
 
-# Note: continue with whichever of these exist in the dataframe.
-all_expected_features = time_domain + freq_domain + nonlinear
-print(f"Total expected features found from groups: {len(all_expected_features)}")
+all_expected_features = time_domain + frequency_domain + nonlinear + other_features
+print("Total categorized features:", len(all_expected_features))
 
 # ======================================================
 # Split (train/test) FIRST to avoid leakage
