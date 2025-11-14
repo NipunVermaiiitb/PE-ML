@@ -6,6 +6,7 @@ from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
     precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 )
+
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -22,6 +23,18 @@ warnings.filterwarnings("ignore")
 # For dimensionality reduction
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+import os
+import zipfile
+from google.colab import files
+
+# Create directory to store plots
+PLOT_DIR = "/content/ga_plots/"
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+def save_plot(filename):
+    """Utility: save current matplotlib figure into the plot folder."""
+    plt.savefig(os.path.join(PLOT_DIR, filename), dpi=300, bbox_inches='tight')
+    plt.close()
 
 # ======================================================
 # Load dataset
@@ -313,28 +326,31 @@ plt.figure(figsize=(7,5))
 plt.plot(best_train_fitness, marker='o', label='Best Train CV Fitness')
 plt.title("GA Convergence Curve (Train CV Fitness)")
 plt.xlabel("Generation")
-plt.ylabel("Best Fitness (Train CV Accuracy)")
+plt.ylabel("Best Fitness")
 plt.grid(True)
 plt.legend()
-plt.show()
+save_plot("ga_convergence_curve.png")
+
 
 plt.figure(figsize=(7,5))
-plt.plot(best_train_fitness, marker='o', label="Train CV Accuracy (best_ind)")
-plt.plot(best_test_accuracy, marker='s', label="Test Accuracy (best_ind)")
-plt.title("Train vs Test Accuracy per GA Generation")
+plt.plot(best_train_fitness, marker='o', label="Train CV Accuracy")
+plt.plot(best_test_accuracy, marker='s', label="Test Accuracy")
+plt.title("Train vs Test Accuracy (GA)")
 plt.xlabel("Generation")
 plt.ylabel("Accuracy")
-plt.legend()
 plt.grid(True)
-plt.show()
+plt.legend()
+save_plot("train_vs_test_accuracy.png")
+
 
 plt.figure(figsize=(7,5))
 plt.plot(population_diversity, marker='o')
-plt.title("Population Diversity Curve (Average Hamming Distance)")
+plt.title("Population Diversity Curve")
 plt.xlabel("Generation")
-plt.ylabel("Average Diversity (Hamming)")
+plt.ylabel("Avg Hamming Distance")
 plt.grid(True)
-plt.show()
+save_plot("population_diversity.png")
+
 
 # ======================================================
 # FEATURE FREQUENCY CHART SPLIT INTO 3 GROUPS (HIGHLIGHT GA FEATURES)
@@ -363,74 +379,40 @@ def make_colors(feature_list):
 
 fig, axes = plt.subplots(3, 1, figsize=(14, 16), constrained_layout=True)
 
-# ----------------- Time-domain subplot -----------------
-colors = make_colors(time_present)
+colors = [ "tab:blue" if f in selected_features else "lightgray" for f in time_present ]
 axes[0].bar(time_present, feature_freq_series.loc[time_present].values, color=colors)
-axes[0].set_title("GA Feature Selection Frequency — Time-domain")
-axes[0].set_ylabel("Selection Count")
+axes[0].set_title("GA Feature Frequency — Time-domain")
 axes[0].tick_params(axis='x', rotation=90)
 
-# Annotation for legend
-axes[0].plot([], [], color="tab:blue", label="GA Selected")
-axes[0].plot([], [], color="lightgray", label="Not Selected")
-axes[0].legend()
-
-# ----------------- Frequency-domain subplot -----------------
-colors = make_colors(freq_present)
+colors = [ "tab:blue" if f in selected_features else "lightgray" for f in freq_present ]
 axes[1].bar(freq_present, feature_freq_series.loc[freq_present].values, color=colors)
-axes[1].set_title("GA Feature Selection Frequency — Frequency-domain")
-axes[1].set_ylabel("Selection Count")
+axes[1].set_title("GA Feature Frequency — Frequency-domain")
 axes[1].tick_params(axis='x', rotation=90)
 
-axes[1].legend(["GA Selected", "Not Selected"])
-
-# ----------------- Nonlinear subplot -----------------
-colors = make_colors(nl_present)
+colors = [ "tab:blue" if f in selected_features else "lightgray" for f in nl_present ]
 axes[2].bar(nl_present, feature_freq_series.loc[nl_present].values, color=colors)
-axes[2].set_title("GA Feature Selection Frequency — Nonlinear")
-axes[2].set_ylabel("Selection Count")
+axes[2].set_title("GA Feature Frequency — Nonlinear")
 axes[2].tick_params(axis='x', rotation=90)
 
-axes[2].legend(["GA Selected", "Not Selected"])
-
-plt.show()
-# ======================================================
-# FEATURE TIMELINE HEATMAP (best-individual each gen)
-# ======================================================
-fs_hist = np.array(feature_selection_history)  # shape (NGEN, n_features)
-plt.figure(figsize=(12, max(4, n_features * 0.12)))
-plt.imshow(fs_hist.T, aspect='auto', cmap='Greens', interpolation='nearest')
-plt.colorbar(label='Selected (1 = selected)')
-plt.yticks(range(n_features), X_full.columns)
-plt.xticks(range(NGEN), [f"Gen{g+1}" for g in range(NGEN)], rotation=45)
-plt.xlabel("Generation")
-plt.ylabel("Feature")
-plt.title("Feature Selection Timeline Heatmap (best individual each gen)")
-plt.tight_layout()
-plt.show()
+save_plot("ga_feature_frequencies.png")
 
 # ======================================================
 # ROC Curve Overlay
 # ======================================================
 plt.figure(figsize=(8,6))
-plotted_any = False
 for name, clf in fitted_classifiers.items():
     if hasattr(clf, "predict_proba"):
         probs = clf.predict_proba(X_test_sel)[:, 1]
         fpr, tpr, _ = roc_curve(y_test, probs)
-        plt.plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_test, probs):.3f})")
-        plotted_any = True
+        plt.plot(fpr, tpr, label=f"{name} AUC={roc_auc_score(y_test, probs):.3f}")
 
-if plotted_any:
-    plt.plot([0,1],[0,1],'k--', alpha=0.6)
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curve Comparison Across Classifiers")
-    plt.legend(loc='lower right')
-    plt.grid(True)
-    plt.show()
-else:
-    print("No classifier provided probability estimates for ROC plotting.")
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.title("ROC Comparison")
+plt.legend()
+plt.grid(True)
+save_plot("roc_curve_overlay.png")
+
 
 # ======================================================
 # PCA and t-SNE: Before vs After GA
@@ -438,32 +420,26 @@ else:
 pca = PCA(n_components=2, random_state=42)
 pca_before = pca.fit_transform(X_train_scaled.values)
 plt.figure(figsize=(7,5))
-plt.scatter(pca_before[:,0], pca_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
-plt.title("PCA - Before GA Feature Selection")
-plt.xlabel("PC1"); plt.ylabel("PC2")
-plt.colorbar(label='label')
-plt.show()
+plt.scatter(pca_before[:,0], pca_before[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("PCA - Before GA")
+save_plot("pca_before_ga.png")
 
 pca_after = PCA(n_components=2, random_state=42).fit_transform(X_train_sel)
 plt.figure(figsize=(7,5))
-plt.scatter(pca_after[:,0], pca_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
-plt.title("PCA - After GA Feature Selection")
-plt.xlabel("PC1"); plt.ylabel("PC2")
-plt.colorbar(label='label')
-plt.show()
+plt.scatter(pca_after[:,0], pca_after[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("PCA - After GA")
+save_plot("pca_after_ga.png")
 
 tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
 tsne_before = tsne.fit_transform(X_train_scaled.values)
 plt.figure(figsize=(7,5))
-plt.scatter(tsne_before[:,0], tsne_before[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
-plt.title("t-SNE - Before GA Feature Selection")
-plt.colorbar(label='label')
-plt.show()
+plt.scatter(tsne_before[:,0], tsne_before[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("t-SNE - Before GA")
+save_plot("tsne_before_ga.png")
 
 tsne_after = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
 tsne_after = tsne_after.fit_transform(X_train_sel)
 plt.figure(figsize=(7,5))
-plt.scatter(tsne_after[:,0], tsne_after[:,1], c=y_train, cmap='coolwarm', alpha=0.6, s=10)
-plt.title("t-SNE - After GA Feature Selection")
-plt.colorbar(label='label')
-plt.show()
+plt.scatter(tsne_after[:,0], tsne_after[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("t-SNE - After GA")
+save_plot("tsne_after_ga.png")
