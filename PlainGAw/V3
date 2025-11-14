@@ -443,3 +443,17 @@ plt.figure(figsize=(7,5))
 plt.scatter(tsne_after[:,0], tsne_after[:,1], c=y_train, cmap='coolwarm', s=10)
 plt.title("t-SNE - After GA")
 save_plot("tsne_after_ga.png")
+
+# ======================================================
+# ZIP ALL PLOTS AND DOWNLOAD
+# ======================================================
+
+zip_path = "/content/GA_PLOTS.zip"
+
+with zipfile.ZipFile(zip_path, "w") as zf:
+    for root, _, files in os.walk(PLOT_DIR):
+        for f in files:
+            zf.write(os.path.join(root, f), arcname=f)
+
+files.download(zip_path)
+print("Download ready:", zip_path)
