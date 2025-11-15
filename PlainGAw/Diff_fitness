@@ -1,0 +1,198 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
+
+from deap import base, creator, tools, algorithms
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+# ======================================================
+# Load Data
+# ======================================================
+df = pd.read_csv('/content/All_subjects_segments60.csv')
+
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True, errors='ignore')
+
+df['label'] = df['condition'].map({'Baseline':0,'Recovery':0,'Stroop':1,'MAT':1})
+df.drop(columns=['condition'], inplace=True, errors='ignore')
+
+X = df.drop(columns=['label'])
+y = df['label']
+
+# ======================================================
+# Split
+# ======================================================
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ======================================================
+# Preprocessing (Impute + Log Transform Skew + Scale)
+# ======================================================
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp  = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+# Log-transform skewed
+skewness = X_train_imp.skew()
+skewed_cols = skewness[abs(skewness) > 1].index.tolist()
+
+def sign_log1p(s):
+    return np.sign(s) * np.log1p(np.abs(s))
+
+for col in skewed_cols:
+    X_train_imp[col] = sign_log1p(X_train_imp[col])
+    X_test_imp[col]  = sign_log1p(X_test_imp[col])
+
+scaler = RobustScaler()
+X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test_scaled  = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+X_full = X_train_scaled.copy()
+n_features = X_full.shape[1]
+
+
+# ======================================================
+# GA FUNCTION (Reusable)
+# ======================================================
+def run_ga_with_classifier(clf_name, clf):
+    print(f"\n\n==================== Running GA for {clf_name} ====================")
+
+    # Reset DEAP safely
+    if "FitnessMax" in creator.__dict__:
+        del creator.FitnessMax
+    if "Individual" in creator.__dict__:
+        del creator.Individual
+
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+    toolbox = base.Toolbox()
+    toolbox.register("attr_bool", random.randint, 0, 1)
+    toolbox.register("individual", tools.initRepeat, creator.Individual,
+                     toolbox.attr_bool, n=n_features)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    def eval_ind(ind):
+        if sum(ind) == 0:
+            return 0.0,
+        selected_cols = [X_full.columns[i] for i in range(n_features) if ind[i] == 1]
+        X_sel = X_full[selected_cols].values
+
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        acc = cross_val_score(clf, X_sel, y_train, cv=cv,
+                              scoring="accuracy", n_jobs=1).mean()
+
+        print(f"[{clf_name}] ACC = {acc:.4f}")
+        return acc,
+
+    toolbox.register("evaluate", eval_ind)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    pop = toolbox.population(n=50)
+    hof = tools.HallOfFame(1)
+
+    NGEN = 20
+    for gen in range(NGEN):
+        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
+        for ind, fit in zip(offspring, map(toolbox.evaluate, offspring)):
+            ind.fitness.values = fit
+        pop = toolbox.select(offspring, len(pop))
+        hof.update(pop)
+        print(f"Gen {gen+1}/{NGEN} - Best fitness = {hof[0].fitness.values[0]:.4f}")
+
+    best_ind = hof[0]
+    best_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+
+    print(f"\n>>> Best {clf_name} Features:")
+    print(best_features)
+    return best_features
+
+
+# ======================================================
+# Run 3 GAs (RF / XGB / KNN)
+# ======================================================
+rf_clf  = RandomForestClassifier(n_estimators=150, random_state=42)
+xgb_clf = xgb.XGBClassifier(
+    n_estimators=150, max_depth=3, learning_rate=0.1,
+    subsample=0.8, colsample_bytree=0.8,
+    eval_metric='logloss', random_state=42
+)
+knn_clf = KNeighborsClassifier()
+
+features_RF  = run_ga_with_classifier("RF", rf_clf)
+features_XGB = run_ga_with_classifier("XGB", xgb_clf)
+features_KNN = run_ga_with_classifier("KNN", knn_clf)
+
+ga_feature_sets = {
+    "GA_RF":  features_RF,
+    "GA_XGB": features_XGB,
+    "GA_KNN": features_KNN
+}
+
+# ======================================================
+# Classifiers for Evaluation
+# ======================================================
+classifiers = {
+    "RF": RandomForestClassifier(n_estimators=150, random_state=42),
+    "XGB": xgb.XGBClassifier(
+        n_estimators=150, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', random_state=42
+    ),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "MLP": MLPClassifier(hidden_layer_sizes=(30,), max_iter=600, random_state=42)
+}
+
+# ======================================================
+# Evaluate ALL Classifiers on ALL GA Feature Sets
+# ======================================================
+results = []
+
+for ga_name, feat_list in ga_feature_sets.items():
+    if len(feat_list) == 0:
+        feat_list = X_full.columns.tolist()
+
+    Xtr = X_train_scaled[feat_list].values
+    Xte = X_test_scaled[feat_list].values
+
+    for clf_name, clf in classifiers.items():
+        clf.fit(Xtr, y_train)
+        y_pred = clf.predict(Xte)
+        y_prob = clf.predict_proba(Xte)[:,1] if hasattr(clf,"predict_proba") else None
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        auc = roc_auc_score(y_test, y_prob) if y_prob is not None else np.nan
+
+        results.append({
+            "GA_Feature_Set": ga_name,
+            "Classifier": clf_name,
+            "Accuracy": acc,
+            "Precision": prec,
+            "Recall": rec,
+            "F1": f1,
+            "AUC": auc,
+            "Num_Features": len(feat_list)
+        })
+
+results_df = pd.DataFrame(results)
+print("\n\n================ FINAL RESULTS ================")
+print(results_df.sort_values(["GA_Feature_Set","Accuracy"], ascending=[True,False]))
