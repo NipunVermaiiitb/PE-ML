@@ -146,10 +146,10 @@ for col in skewed_cols:
 scaler = RobustScaler()
 X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
 X_test_scaled = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+# ======================================================
+# GA Feature Selection on TRAIN ONLY (Corrected Convergence Tracking)
+# ======================================================
 
-# ======================================================
-# GA Feature Selection on TRAIN ONLY (same approach as before)
-# ======================================================
 X_full = X_train_scaled.copy()
 n_features = X_full.shape[1]
 
@@ -168,16 +168,15 @@ toolbox.register("individual", tools.initRepeat, creator.Individual,
                  toolbox.attr_bool, n=n_features)
 toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-# Use cross_val_score inside fitness to be cleaner/faster
 def eval_individual(individual):
     if sum(individual) == 0:
         return 0.0,
     selected_cols = [X_full.columns[i] for i in range(n_features) if individual[i] == 1]
-    X_sub = X_full[selected_cols].values
-
     clf = RandomForestClassifier(n_estimators=150, random_state=42)
+
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    scores = cross_val_score(clf, X_sub, y_train, cv=cv, scoring='accuracy', n_jobs=1)
+    scores = cross_val_score(clf, X_full[selected_cols].values, y_train,
+                             cv=cv, scoring='accuracy', n_jobs=1)
     return scores.mean(),
 
 toolbox.register("evaluate", eval_individual)
@@ -185,80 +184,92 @@ toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", tools.mutFlipBit, indpb=0.15)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
-# GA tracking arrays
+# --- GA tracking ---
 pop = toolbox.population(n=60)
 hof_main = tools.HallOfFame(1)
-NGEN = 10
+NGEN = 20
 
 best_train_fitness = []
+avg_fitness = []
+median_fitness = []
+worst_fitness = []
+
 best_test_accuracy = []
 population_diversity = []
 feature_selection_history = []
 feature_frequency_population = np.zeros(n_features, dtype=int)
 
 for gen in range(NGEN):
+    # Variation
     offspring = algorithms.varAnd(pop, toolbox, cxpb=0.6, mutpb=0.3)
 
     # Evaluate offspring
     fits = list(map(toolbox.evaluate, offspring))
-    for fit, ind in zip(fits, offspring):
+    for ind, fit in zip(offspring, fits):
         ind.fitness.values = fit
 
-    # Select next generation
+    # Select new generation
     pop = toolbox.select(offspring, len(pop))
     hof_main.update(pop)
 
-    # Best individual and tracking
+    # --- Fitness stats ---
+    fitness_values = [ind.fitness.values[0] for ind in pop]
+
     best_ind = hof_main[0]
     best_fit = best_ind.fitness.values[0]
+
     best_train_fitness.append(best_fit)
+    avg_fitness.append(np.mean(fitness_values))
+    median_fitness.append(np.median(fitness_values))
+    worst_fitness.append(np.min(fitness_values))
 
+    # --- Population diversity ---
     pop_matrix = np.array([np.array(ind, dtype=int) for ind in pop])
-    # update cumulative feature frequency over whole population & gens
-    feature_frequency_population += pop_matrix.sum(axis=0)
+    pop_size = len(pop_matrix)
 
-    # diversity (average pairwise Hamming distance)
-    pop_size = pop_matrix.shape[0]
     if pop_size > 1:
-        dists = []
+        d = []
         for i in range(pop_size):
             for j in range(i+1, pop_size):
-                dists.append(np.sum(pop_matrix[i] != pop_matrix[j]) / n_features)
-        population_diversity.append(np.mean(dists))
+                d.append(np.sum(pop_matrix[i] != pop_matrix[j]) / n_features)
+        population_diversity.append(np.mean(d))
     else:
-        population_diversity.append(0.0)
+        population_diversity.append(0)
 
-    # save best individual's bitmask
-    feature_selection_history.append(np.array(best_ind, dtype=int))
+    # Track feature frequencies
+    feature_frequency_population += pop_matrix.sum(axis=0)
 
-    # Evaluate test accuracy for best individual of this gen
-    selected_cols = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
-    if len(selected_cols) == 0:
-        selected_cols = X_full.columns.tolist()
+    # Test accuracy of best individual
+    chosen_cols = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
+    if len(chosen_cols) == 0:
+        chosen_cols = X_full.columns.tolist()
 
-    Xtr_sel = X_train_scaled[selected_cols].values
-    Xte_sel = X_test_scaled[selected_cols].values
+    Xtr_sel = X_train_scaled[chosen_cols].values
+    Xte_sel = X_test_scaled[chosen_cols].values
 
     rf_tmp = RandomForestClassifier(n_estimators=150, random_state=42)
     rf_tmp.fit(Xtr_sel, y_train)
     y_pred_test = rf_tmp.predict(Xte_sel)
-    test_acc = accuracy_score(y_test, y_pred_test)
-    best_test_accuracy.append(test_acc)
+    best_test_accuracy.append(accuracy_score(y_test, y_pred_test))
 
-    print(f"Gen {gen+1}/{NGEN} | Best Fitness = {best_fit:.4f} | TestAcc (best_ind) = {test_acc:.4f}")
+    print(f"Gen {gen+1}/{NGEN} | "
+          f"Best = {best_fit:.4f} | "
+          f"Avg = {avg_fitness[-1]:.4f} | "
+          f"Med = {median_fitness[-1]:.4f} | "
+          f"Worst = {worst_fitness[-1]:.4f}")
 
-# Final selected features from hall-of-fame
+# Final selected features
 best_ind = hof_main[0]
 selected_features = [X_full.columns[i] for i in range(n_features) if best_ind[i] == 1]
 print("\nSelected GA Features:")
-print(selected_features)
+print(selected_features if selected_features else "None → Using all.")
 if len(selected_features) == 0:
-    print("GA selected zero features — using all.")
     selected_features = X_full.columns.tolist()
-
-# Prepare selected train/test arrays
+# ======================================================
+# FINAL SELECTED TRAIN/TEST MATRICES
+# ======================================================
 X_train_sel = X_train_scaled[selected_features].values
-X_test_sel = X_test_scaled[selected_features].values
+X_test_sel  = X_test_scaled[selected_features].values
 
 # ======================================================
 # Classifiers
@@ -322,14 +333,19 @@ print(df_res)
 # ======================================================
 # PLOTS (GA convergence, popul diversity, train vs test)
 # ======================================================
-plt.figure(figsize=(7,5))
-plt.plot(best_train_fitness, marker='o', label='Best Train CV Fitness')
-plt.title("GA Convergence Curve (Train CV Fitness)")
+plt.figure(figsize=(8,6))
+plt.plot(best_train_fitness, marker='o', label="Best")
+plt.plot(avg_fitness, marker='s', label="Average")
+plt.plot(median_fitness, marker='^', label="Median")
+plt.plot(worst_fitness, marker='x', label="Worst")
+
+plt.title("GA Convergence (Fitness Evolution)")
 plt.xlabel("Generation")
-plt.ylabel("Best Fitness")
+plt.ylabel("Fitness")
 plt.grid(True)
 plt.legend()
 save_plot("ga_convergence_curve.png")
+
 
 
 plt.figure(figsize=(7,5))
