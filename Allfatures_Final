@@ -1,0 +1,225 @@
+import pandas as pd
+import numpy as np
+import time
+import psutil
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+)
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import os
+import zipfile
+from google.colab import files
+import warnings
+warnings.filterwarnings("ignore")
+
+# ==========================
+# Plot directory
+# ==========================
+PLOT_DIR = "/content/plots/"
+os.makedirs(PLOT_DIR, exist_ok=True)
+def save_plot(filename):
+    plt.savefig(os.path.join(PLOT_DIR, filename), dpi=300, bbox_inches='tight')
+    plt.close()
+
+# ==========================
+# Load dataset
+# ==========================
+df = pd.read_csv('/content/All_subjects_segments60.csv')
+
+# Drop irrelevant columns
+drop_cols = ['Subject_ID','ApEn','scope','segment','SubjectID','SubjectName']
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+# Binary label
+df['label'] = df['condition'].map({'Baseline':0, 'Recovery':0, 'Stroop':1, 'MAT':1})
+df = df.drop(columns=['condition'], errors='ignore')
+
+# ==========================
+# Keep only selected features
+# ==========================
+selected_features = [
+    'N', 'RMSSD_ms', 'SDSD_ms', 'NN20', 'pNN20_pct', 'NN50', 'pNN50_pct',
+    'HR_mean_bpm', 'HR_std_bpm', 'HR_median_bpm', 'IQR_RR_ms', 'CVSD',
+    'SD2_ms', 'HF_ms2', 'lnLF', 'lnHF', 'LF_pct', 'LF_nu', 'LF_HF',
+    'fpeak_HF', 'fc_LF', 'HiguchiFD'
+]
+existing_features = [f for f in selected_features if f in df.columns]
+X = df[existing_features]
+y = df['label'].astype(int)
+
+# ==========================
+# Train/Test split
+# ==========================
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+print(f"Train shape: {X_train_raw.shape}, Test shape: {X_test_raw.shape}")
+
+# ==========================
+# Impute missing values
+# ==========================
+imputer = SimpleImputer(strategy='median')
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
+X_test_imp  = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
+
+# ==========================
+# Log-transform skewed features
+# ==========================
+skewness = X_train_imp.skew(numeric_only=True)
+skewed_cols = skewness[skewness.abs() > 1].index.tolist()
+
+def sign_log1p(train_series, test_series):
+    tr = train_series.copy()
+    te = test_series.copy()
+    tr_trans = np.sign(tr) * np.log1p(np.abs(tr))
+    te_trans = np.sign(te) * np.log1p(np.abs(te))
+    return tr_trans, te_trans
+
+for col in skewed_cols:
+    if col in X_train_imp.columns:
+        tr_col, te_col = sign_log1p(X_train_imp[col], X_test_imp[col])
+        X_train_imp[col] = tr_col
+        X_test_imp[col] = te_col
+
+# ==========================
+# Scale features
+# ==========================
+scaler = RobustScaler()
+X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_imp), columns=X.columns)
+X_test_scaled  = pd.DataFrame(scaler.transform(X_test_imp), columns=X.columns)
+
+# ==========================
+# Classifiers
+# ==========================
+classifiers = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+    "KNN": KNeighborsClassifier(),
+    "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+    "Logistic": LogisticRegression(max_iter=600, random_state=42),
+    "XGBoost": xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='logloss', use_label_encoder=False, random_state=42
+    ),
+    "MLP": MLPClassifier(hidden_layer_sizes=(20,), max_iter=600, random_state=42)
+}
+
+# ==========================
+# Evaluate models + computational metrics
+# ==========================
+results = []
+fitted_classifiers = {}
+
+for name, clf in classifiers.items():
+    print(f"\n===================== {name} =====================")
+
+    process = psutil.Process()
+    mem_before = process.memory_info().rss / (1024**2)  # MB
+    t_wall_start = time.time()
+    t_cpu_start = time.process_time()
+
+    clf.fit(X_train_scaled.values, y_train)
+
+    t_cpu_end = time.process_time()
+    t_wall_end = time.time()
+    mem_after = process.memory_info().rss / (1024**2)  # MB
+
+    fitted_classifiers[name] = clf
+
+    y_pred = clf.predict(X_test_scaled.values)
+    y_prob = clf.predict_proba(X_test_scaled.values)[:,1] if hasattr(clf, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_prob) if y_prob is not None else float("nan")
+
+    cpu_time = t_cpu_end - t_cpu_start
+    wall_time = t_wall_end - t_wall_start
+    mem_used = mem_after - mem_before
+
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall   : {rec:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"AUC      : {auc:.4f}")
+    print(f"CPU Time (s): {cpu_time:.3f}")
+    print(f"Wall Time (s): {wall_time:.3f}")
+    print(f"Memory Used (MB): {mem_used:.3f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap='Blues')
+    plt.title(f"{name} - Test Confusion Matrix")
+    plt.show()
+
+    results.append({
+        "Model": name, "Accuracy": acc, "Precision": prec,
+        "Recall": rec, "F1 Score": f1, "AUC": auc,
+        "CPU Time (s)": cpu_time, "Wall Time (s)": wall_time,
+        "Memory Used (MB)": mem_used
+    })
+
+df_res = pd.DataFrame(results)
+print("\n=================== FINAL RESULTS ===================")
+print(df_res)
+
+# ==========================
+# ROC Curve Overlay
+# ==========================
+plt.figure(figsize=(8,6))
+for name, clf in fitted_classifiers.items():
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(X_test_scaled.values)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, probs)
+        plt.plot(fpr, tpr, label=f"{name} AUC={roc_auc_score(y_test, probs):.3f}")
+
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.title("ROC Comparison")
+plt.legend()
+plt.grid(True)
+save_plot("roc_curve.png")
+
+# ==========================
+# PCA & t-SNE (2D visualization)
+# ==========================
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+pca = PCA(n_components=2, random_state=42)
+pca_transformed = pca.fit_transform(X_train_scaled.values)
+plt.figure(figsize=(7,5))
+plt.scatter(pca_transformed[:,0], pca_transformed[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("PCA - Selected Features")
+save_plot("pca_selected.png")
+
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca')
+tsne_transformed = tsne.fit_transform(X_train_scaled.values)
+plt.figure(figsize=(7,5))
+plt.scatter(tsne_transformed[:,0], tsne_transformed[:,1], c=y_train, cmap='coolwarm', s=10)
+plt.title("t-SNE - Selected Features")
+save_plot("tsne_selected.png")
+
+# ==========================
+# ZIP plots for download
+# ==========================
+zip_path = "/content/PLOTS.zip"
+with zipfile.ZipFile(zip_path, "w") as zf:
+    for root, _, files in os.walk(PLOT_DIR):
+        for f in files:
+            zf.write(os.path.join(root, f), arcname=f)
+
+files.download(zip_path)
+print("Plots ZIP ready:", zip_path)
